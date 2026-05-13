@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import threading
 import time
 import uuid
 
@@ -8,6 +9,11 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+
+try:
+    import mediapipe as mp
+except ImportError:
+    mp = None
 
 app = FastAPI()
 app.add_middleware(
@@ -49,6 +55,40 @@ FACE_CASCADES = {
     "frontal_alt": cv2.CascadeClassifier(os.path.join(CASCADE_BASE, "haarcascade_frontalface_alt2.xml")),
     "profile": cv2.CascadeClassifier(os.path.join(CASCADE_BASE, "haarcascade_profileface.xml")),
 }
+MP_FACE_DETECTOR = None
+MP_FACE_DETECTOR_LOCK = threading.Lock()
+if mp is not None:
+    try:
+        MP_FACE_DETECTOR = mp.solutions.face_detection.FaceDetection(
+            model_selection=1,
+            min_detection_confidence=0.45,
+        )
+    except Exception:
+        MP_FACE_DETECTOR = None
+MP_FACE_LANDMARKER = None
+MP_FACE_LANDMARKER_LOCK = threading.Lock()
+MP_FACE_LANDMARKER_MODEL = os.getenv(
+    "VERITAI_MEDIAPIPE_FACE_LANDMARKER_MODEL",
+    os.path.join(BASE_DIR, "models", "face_landmarker.task"),
+)
+if mp is not None and hasattr(mp, "tasks") and os.path.exists(MP_FACE_LANDMARKER_MODEL):
+    try:
+        MP_FACE_LANDMARKER = mp.tasks.vision.FaceLandmarker.create_from_options(
+            mp.tasks.vision.FaceLandmarkerOptions(
+                base_options=mp.tasks.BaseOptions(model_asset_path=MP_FACE_LANDMARKER_MODEL),
+                running_mode=mp.tasks.vision.RunningMode.IMAGE,
+                num_faces=2,
+                min_face_detection_confidence=0.35,
+                min_face_presence_confidence=0.35,
+            )
+        )
+    except Exception:
+        MP_FACE_LANDMARKER = None
+YUNET_FACE_MODEL = os.getenv(
+    "VERITAI_YUNET_FACE_MODEL",
+    os.path.join(BASE_DIR, "models", "face_detection_yunet_2023mar.onnx"),
+)
+YUNET_FACE_DETECTOR_LOCK = threading.Lock()
 REGION_COLORS = {
     "forehead": (78, 121, 255),
     "left_eye_zone": (92, 200, 255),
@@ -81,6 +121,28 @@ POINT_LABELS = {
 }
 
 
+def env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name, default, minimum=None):
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    if minimum is not None:
+        return max(minimum, value)
+    return value
+
+
+DEBUG_ARTIFACTS = env_bool("VERITAI_DEBUG_ARTIFACTS", False)
+MAX_IMAGE_WIDTH = env_int("VERITAI_MAX_IMAGE_WIDTH", 1280, minimum=320)
+MAX_FACE_CANDIDATES = env_int("VERITAI_MAX_FACE_CANDIDATES", 8, minimum=1)
+
+
 def normalize_path(path):
     return path.replace("\\", "/")
 
@@ -91,14 +153,16 @@ def decode_image(contents: bytes):
 
 
 def preprocess_image(img):
+    bgr = img.copy()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     equalized = cv2.equalizeHist(gray)
     clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(gray)
     enhanced = cv2.addWeighted(clahe, 0.62, equalized, 0.38, 0.0)
     blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
     grad_x = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
     grad_y = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
-    return {"gray": gray, "equalized": enhanced, "clahe": clahe, "blurred": blurred, "gradX": grad_x, "gradY": grad_y}
+    return {"bgr": bgr, "gray": gray, "rgb": rgb, "equalized": enhanced, "clahe": clahe, "blurred": blurred, "gradX": grad_x, "gradY": grad_y}
 
 
 def make_debug_paths():
@@ -231,6 +295,11 @@ def expand_detected_box(box, image_shape, detector_name):
         right_scale = 0.28
         top_scale = 0.24
         bottom_scale = 0.40
+    elif detector_name in {"mediapipe", "mediapipe_landmarker", "yunet"}:
+        left_scale = 0.24
+        right_scale = 0.24
+        top_scale = 0.24
+        bottom_scale = 0.40
     elif detector_name == "response_fallback":
         left_scale = 0.10
         right_scale = 0.10
@@ -248,6 +317,131 @@ def expand_detected_box(box, image_shape, detector_name):
     return x1, y1, max(1, x2 - x1), max(1, y2 - y1)
 
 
+def build_default_face_mask(face_gray, detector_name):
+    h, w = face_gray.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    center_x = int(round(w * 0.5))
+    center_y = int(round(h * (0.50 if detector_name == "profile" else 0.52)))
+    axis_x = max(12, int(round(w * (0.38 if detector_name == "profile" else 0.43))))
+    axis_y = max(16, int(round(h * 0.49)))
+    cv2.ellipse(mask, (center_x, center_y), (axis_x, axis_y), 0, 0, 360, 255, -1)
+    return mask
+
+
+def extract_primary_contour(mask):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    return max(contours, key=cv2.contourArea)
+
+
+def contour_to_points(contour, box):
+    if contour is None:
+        return []
+    x, y, _, _ = box
+    points = contour.reshape(-1, 2)
+    return [{"x": int(x + px), "y": int(y + py)} for px, py in points]
+
+
+def build_face_outline_mask(face_bgr, face_gray, detector_name):
+    h, w = face_gray.shape[:2]
+    if h < 24 or w < 24:
+        default_mask = np.full((h, w), 255, dtype=np.uint8)
+        return default_mask, extract_primary_contour(default_mask)
+
+    default_mask = build_default_face_mask(face_gray, detector_name)
+    init_mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+    init_mask[default_mask > 0] = cv2.GC_PR_FGD
+
+    inner_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.ellipse(
+        inner_mask,
+        (int(round(w * 0.5)), int(round(h * 0.54))),
+        (max(8, int(round(w * 0.20))), max(12, int(round(h * 0.28)))),
+        0,
+        0,
+        360,
+        255,
+        -1,
+    )
+    init_mask[inner_mask > 0] = cv2.GC_FGD
+
+    border = max(2, int(round(min(h, w) * 0.04)))
+    init_mask[:border, :] = cv2.GC_BGD
+    init_mask[-border:, :] = cv2.GC_BGD
+    init_mask[:, :border] = cv2.GC_BGD
+    init_mask[:, -border:] = cv2.GC_BGD
+
+    try:
+        bg_model = np.zeros((1, 65), np.float64)
+        fg_model = np.zeros((1, 65), np.float64)
+        cv2.grabCut(face_bgr, init_mask, None, bg_model, fg_model, 2, cv2.GC_INIT_WITH_MASK)
+        mask = np.where(
+            (init_mask == cv2.GC_FGD) | (init_mask == cv2.GC_PR_FGD),
+            255,
+            0,
+        ).astype(np.uint8)
+    except cv2.error:
+        mask = default_mask
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    contour = extract_primary_contour(mask)
+    min_area = max(1.0, w * h * 0.18)
+    if contour is None or cv2.contourArea(contour) < min_area:
+        mask = default_mask
+        contour = extract_primary_contour(mask)
+    else:
+        hull = cv2.convexHull(contour)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(mask, [hull], -1, 255, -1)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        support_mask = cv2.erode(default_mask, kernel, iterations=1)
+        mask = cv2.bitwise_or(mask, support_mask)
+        contour = hull
+
+    return mask, contour
+
+
+def extract_face_region(image, preprocessed, box, detector_name):
+    x, y, w, h = box
+    face_bgr = image[y : y + h, x : x + w]
+    face_gray = preprocessed["equalized"][y : y + h, x : x + w]
+    if face_bgr.size == 0 or face_gray.size == 0:
+        return None
+    face_mask, contour = build_face_outline_mask(face_bgr, face_gray, detector_name)
+    return {
+        "bbox": box,
+        "bgr": face_bgr,
+        "gray": face_gray,
+        "mask": face_mask,
+        "contour": contour,
+    }
+
+
+def masked_response(response_map, face_mask):
+    if face_mask is None or response_map.size == 0:
+        return normalize_response(response_map)
+    if face_mask.shape != response_map.shape:
+        resized_mask = cv2.resize(face_mask, (response_map.shape[1], response_map.shape[0]), interpolation=cv2.INTER_NEAREST)
+    else:
+        resized_mask = face_mask
+    mask_weight = 0.06 + 0.94 * (resized_mask.astype(np.float32) / 255.0)
+    masked = response_map.astype(np.float32) * mask_weight
+    return normalize_response(masked)
+
+
+def masked_values(image, face_mask):
+    if face_mask is None or face_mask.size == 0:
+        return image.reshape(-1)
+    values = image[face_mask > 0]
+    if values.size == 0:
+        return image.reshape(-1)
+    return values
+
+
 def generate_response_face_proposals(preprocessed):
     base = preprocessed["equalized"]
     eye_map = build_eye_response(base)
@@ -256,7 +450,7 @@ def generate_response_face_proposals(preprocessed):
     image_h, image_w = base.shape[:2]
     min_dim = min(image_h, image_w)
     proposals = []
-    for width in sorted({max(52, int(min_dim * ratio)) for ratio in (0.42, 0.52, 0.62)}):
+    for width in sorted({max(52, int(min_dim * ratio)) for ratio in (0.38, 0.48, 0.58, 0.66)}):
         height = int(width * 1.18)
         if height >= image_h or width >= image_w:
             continue
@@ -268,10 +462,11 @@ def generate_response_face_proposals(preprocessed):
                 nose_score = region_response_score(nose_map, x + width * 0.28, y + height * 0.28, x + width * 0.72, y + height * 0.76)
                 mouth_score = region_response_score(mouth_map, x + width * 0.22, y + height * 0.60, x + width * 0.78, y + height * 0.92)
                 eye_balance = max(0.0, 1.0 - abs(left_eye - right_eye))
+                profile_asymmetry = abs(left_eye - right_eye)
                 center_x = (x + width / 2.0) / max(image_w, 1)
                 center_y = (y + height / 2.0) / max(image_h, 1)
                 center_prior = max(0.0, 1.0 - abs(center_x - 0.5) / 0.5) * max(0.0, 1.0 - abs(center_y - 0.48) / 0.52)
-                score = (
+                frontal_score = (
                     0.18 * max(left_eye, right_eye)
                     + 0.18 * min(left_eye, right_eye)
                     + 0.22 * nose_score
@@ -280,7 +475,17 @@ def generate_response_face_proposals(preprocessed):
                     + 0.08 * center_prior
                     + 0.06 * min(left_eye, right_eye, nose_score)
                 )
-                if score < 0.54:
+                profile_score = (
+                    0.28 * max(left_eye, right_eye)
+                    + 0.24 * nose_score
+                    + 0.18 * mouth_score
+                    + 0.12 * profile_asymmetry
+                    + 0.10 * center_prior
+                    + 0.08 * min(max(left_eye, right_eye), nose_score)
+                )
+                score = max(frontal_score, profile_score)
+                threshold = 0.54 if eye_balance >= 0.34 else 0.57
+                if score < threshold:
                     continue
                 proposals.append(
                     {
@@ -291,7 +496,7 @@ def generate_response_face_proposals(preprocessed):
                     }
                 )
     proposals = non_max_suppression(proposals, iou_threshold=0.26)
-    return proposals[:3]
+    return proposals[:4]
 
 
 def detect_with_cascade(cascade, image, flipped=False, aggressive=False):
@@ -301,6 +506,7 @@ def detect_with_cascade(cascade, image, flipped=False, aggressive=False):
     configs = [(1.08, 5, (max(40, image.shape[1] // 16), max(40, image.shape[0] // 16)))]
     if aggressive:
         configs.append((1.05, 4, base_min_size))
+        configs.append((1.03, 3, (max(30, image.shape[1] // 24), max(30, image.shape[0] // 24))))
     image_width = image.shape[1]
     candidates = []
     for scale_factor, min_neighbors, min_size in configs:
@@ -333,6 +539,154 @@ def detect_with_cascade(cascade, image, flipped=False, aggressive=False):
     return candidates
 
 
+def detect_with_mediapipe(preprocessed):
+    if MP_FACE_DETECTOR is None:
+        return []
+
+    image = preprocessed["gray"]
+    image_h, image_w = image.shape[:2]
+    rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    try:
+        with MP_FACE_DETECTOR_LOCK:
+            results = MP_FACE_DETECTOR.process(rgb)
+    except Exception:
+        return []
+
+    candidates = []
+    for detection in getattr(results, "detections", None) or []:
+        bbox = detection.location_data.relative_bounding_box
+        x = int(round(bbox.xmin * image_w))
+        y = int(round(bbox.ymin * image_h))
+        w = int(round(bbox.width * image_w))
+        h = int(round(bbox.height * image_h))
+        x = clamp(x, 0, max(image_w - 1, 0))
+        y = clamp(y, 0, max(image_h - 1, 0))
+        w = clamp(w, 1, image_w - x)
+        h = clamp(h, 1, image_h - y)
+        if min(w, h) < 34:
+            continue
+        score = float(detection.score[0]) if detection.score else 0.45
+        candidates.append(
+            {
+                "box": (int(x), int(y), int(w), int(h)),
+                "rawWeight": None,
+                "detector": "mediapipe",
+                "score": round(float(max(0.0, min(1.0, score))), 4),
+            }
+        )
+    return candidates
+
+
+def point_from_mediapipe_landmark(landmarks, index, image_w, image_h):
+    point = landmarks[index]
+    return (
+        clamp(int(round(float(point.x) * image_w)), 0, max(image_w - 1, 0)),
+        clamp(int(round(float(point.y) * image_h)), 0, max(image_h - 1, 0)),
+    )
+
+
+def average_mediapipe_points(landmarks, indices, image_w, image_h):
+    points = [point_from_mediapipe_landmark(landmarks, index, image_w, image_h) for index in indices]
+    x = int(round(sum(point[0] for point in points) / float(max(len(points), 1))))
+    y = int(round(sum(point[1] for point in points) / float(max(len(points), 1))))
+    return x, y
+
+
+def detect_with_mediapipe_landmarker(preprocessed):
+    if MP_FACE_LANDMARKER is None or mp is None:
+        return []
+
+    rgb = preprocessed.get("rgb")
+    if rgb is None:
+        return []
+    image_h, image_w = rgb.shape[:2]
+    try:
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        with MP_FACE_LANDMARKER_LOCK:
+            results = MP_FACE_LANDMARKER.detect(mp_image)
+    except Exception:
+        return []
+
+    candidates = []
+    for landmarks in getattr(results, "face_landmarks", None) or []:
+        if not landmarks:
+            continue
+        xs = [clamp(int(round(float(point.x) * image_w)), 0, max(image_w - 1, 0)) for point in landmarks]
+        ys = [clamp(int(round(float(point.y) * image_h)), 0, max(image_h - 1, 0)) for point in landmarks]
+        x1 = min(xs)
+        y1 = min(ys)
+        x2 = max(xs)
+        y2 = max(ys)
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        if min(w, h) < 34:
+            continue
+        candidates.append(
+            {
+                "box": (int(x1), int(y1), int(w), int(h)),
+                "rawWeight": None,
+                "detector": "mediapipe_landmarker",
+                "score": 0.999,
+                "mediapipeLandmarks": landmarks,
+            }
+        )
+    return candidates
+
+
+def detect_with_yunet(preprocessed):
+    if not os.path.exists(YUNET_FACE_MODEL) or not hasattr(cv2, "FaceDetectorYN_create"):
+        return []
+
+    image = preprocessed.get("bgr")
+    if image is None:
+        return []
+    image_h, image_w = image.shape[:2]
+    try:
+        with YUNET_FACE_DETECTOR_LOCK:
+            detector = cv2.FaceDetectorYN_create(
+                YUNET_FACE_MODEL,
+                "",
+                (int(image_w), int(image_h)),
+                score_threshold=0.72,
+                nms_threshold=0.30,
+                top_k=20,
+            )
+            _, detections = detector.detect(image)
+    except Exception:
+        return []
+
+    candidates = []
+    if detections is None:
+        return candidates
+    for row in detections:
+        x, y, w, h = [float(value) for value in row[:4]]
+        score = float(row[-1]) if len(row) >= 15 else 0.72
+        x = clamp(int(round(x)), 0, max(image_w - 1, 0))
+        y = clamp(int(round(y)), 0, max(image_h - 1, 0))
+        w = clamp(int(round(w)), 1, image_w - x)
+        h = clamp(int(round(h)), 1, image_h - y)
+        if min(w, h) < 34:
+            continue
+        landmarks = []
+        for index in range(4, min(14, len(row)), 2):
+            landmarks.append(
+                (
+                    clamp(int(round(float(row[index]))), 0, max(image_w - 1, 0)),
+                    clamp(int(round(float(row[index + 1]))), 0, max(image_h - 1, 0)),
+                )
+            )
+        candidates.append(
+            {
+                "box": (int(x), int(y), int(w), int(h)),
+                "rawWeight": None,
+                "detector": "yunet",
+                "score": round(float(max(0.0, min(1.0, score))), 4),
+                "yunetLandmarks": landmarks,
+            }
+        )
+    return candidates
+
+
 def detect_faces(preprocessed):
     image = preprocessed["equalized"]
     base_gray = preprocessed["gray"]
@@ -340,13 +694,16 @@ def detect_faces(preprocessed):
     flipped = cv2.flip(image, 1)
     flipped_clahe = cv2.flip(clahe, 1)
     candidates = []
+    candidates.extend(detect_with_mediapipe(preprocessed))
     for detector_name, cascade in FACE_CASCADES.items():
         if detector_name == "profile":
             boxes = (
                 detect_with_cascade(cascade, image, aggressive=True)
                 + detect_with_cascade(cascade, clahe, aggressive=True)
+                + detect_with_cascade(cascade, base_gray, aggressive=True)
                 + detect_with_cascade(cascade, flipped, flipped=True, aggressive=True)
                 + detect_with_cascade(cascade, flipped_clahe, flipped=True, aggressive=True)
+                + detect_with_cascade(cascade, cv2.flip(base_gray, 1), flipped=True, aggressive=True)
             )
         else:
             boxes = (
@@ -360,34 +717,41 @@ def detect_faces(preprocessed):
             candidates.append(candidate)
     candidates = non_max_suppression(candidates, iou_threshold=0.24)
     candidates = suppress_contained_candidates(candidates)
-    if not candidates or max(candidate["score"] for candidate in candidates) < 0.46:
+    if not candidates or max(candidate["score"] for candidate in candidates) < 0.58 or len(candidates) < 2:
         candidates.extend(generate_response_face_proposals(preprocessed))
     refined = []
     for candidate in candidates:
         refined.append({**candidate, "box": expand_detected_box(candidate["box"], image.shape, candidate["detector"])})
     refined = non_max_suppression(refined, iou_threshold=0.28)
     refined = suppress_contained_candidates(refined)
-    return refined
+    refined.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+    return refined[:MAX_FACE_CANDIDATES]
 
 
-def build_eye_response(face_gray):
+def build_eye_response(face_gray, face_mask=None):
     h, w = face_gray.shape[:2]
-    upper = face_gray[: max(int(h * 0.52), 1), :]
+    upper = face_gray[: max(int(h * 0.54), 1), :]
     blackhat = cv2.morphologyEx(upper, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 5)))
+    blackhat_wide = cv2.morphologyEx(upper, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5)))
     grad_x = normalize_response(np.abs(cv2.Sobel(upper, cv2.CV_32F, 1, 0, ksize=3)))
-    dark = normalize_response(blackhat)
+    grad_y = normalize_response(np.abs(cv2.Sobel(upper, cv2.CV_32F, 0, 1, ksize=3)))
+    dark = normalize_response(0.62 * blackhat + 0.38 * blackhat_wide)
     x_coords = np.linspace(0.0, 1.0, w, dtype=np.float32)
     y_coords = np.linspace(0.0, 1.0, upper.shape[0], dtype=np.float32)
-    x_prior = 1.0 - np.abs(x_coords - 0.5) * 0.75
-    y_prior = 1.0 - np.abs(y_coords - 0.50) / 0.34
+    left_lobe = np.clip(1.0 - np.abs(x_coords - 0.34) / 0.24, 0.0, 1.0)
+    right_lobe = np.clip(1.0 - np.abs(x_coords - 0.66) / 0.24, 0.0, 1.0)
+    bridge_penalty = 1.0 - 0.28 * np.clip(1.0 - np.abs(x_coords - 0.50) / 0.12, 0.0, 1.0)
+    x_prior = np.maximum(left_lobe, right_lobe) * bridge_penalty
+    y_prior = np.clip(1.0 - np.abs(y_coords - 0.46) / 0.26, 0.0, 1.0)
     prior = np.clip(np.outer(y_prior, x_prior), 0.0, 1.0)
-    response = normalize_response((0.58 * dark + 0.42 * grad_x) * prior)
+    brow_penalty = np.clip(np.linspace(0.72, 1.0, upper.shape[0], dtype=np.float32), 0.0, 1.0)
+    response = normalize_response((0.54 * dark + 0.32 * grad_x + 0.14 * np.maximum(0.0, 1.0 - grad_y)) * prior * brow_penalty[:, None])
     full_map = np.zeros_like(face_gray, dtype=np.float32)
     full_map[: upper.shape[0], :] = response
-    return full_map
+    return masked_response(full_map, face_mask)
 
 
-def build_nose_response(face_gray):
+def build_nose_response(face_gray, face_mask=None):
     h, w = face_gray.shape[:2]
     y1 = int(h * 0.20)
     y2 = max(y1 + 1, int(h * 0.82))
@@ -403,10 +767,10 @@ def build_nose_response(face_gray):
     response = normalize_response((0.45 * normalize_response(tophat) + 0.30 * bright + 0.25 * vertical) * prior)
     full_map = np.zeros_like(face_gray, dtype=np.float32)
     full_map[y1:y2, :] = response
-    return full_map
+    return masked_response(full_map, face_mask)
 
 
-def build_mouth_response(face_gray):
+def build_mouth_response(face_gray, face_mask=None):
     h, w = face_gray.shape[:2]
     y1 = int(h * 0.58)
     y2 = max(y1 + 1, int(h * 0.92))
@@ -422,7 +786,7 @@ def build_mouth_response(face_gray):
     response = normalize_response((0.64 * dark + 0.36 * horizontal) * prior)
     full_map = np.zeros_like(face_gray, dtype=np.float32)
     full_map[y1:y2, :] = response
-    return full_map
+    return masked_response(full_map, face_mask)
 
 
 def contour_boxes(response_map, threshold=0.46):
@@ -521,6 +885,111 @@ def make_eye_candidate(face_gray, response_map, box, reason_prefix):
     }
 
 
+def make_mediapipe_eye_candidate(bbox, landmarks, corner_indices, vertical_pairs, image_shape, reason):
+    image_h, image_w = image_shape[:2]
+    x, y, w, h = bbox
+    corner_a = point_from_mediapipe_landmark(landmarks, corner_indices[0], image_w, image_h)
+    corner_b = point_from_mediapipe_landmark(landmarks, corner_indices[1], image_w, image_h)
+    center_x = (corner_a[0] + corner_b[0]) / 2.0
+    center_y = (corner_a[1] + corner_b[1]) / 2.0
+    eye_width = max(distance({"x": corner_a[0], "y": corner_a[1]}, {"x": corner_b[0], "y": corner_b[1]}), 1.0)
+    heights = []
+    for top_index, bottom_index in vertical_pairs:
+        top = point_from_mediapipe_landmark(landmarks, top_index, image_w, image_h)
+        bottom = point_from_mediapipe_landmark(landmarks, bottom_index, image_w, image_h)
+        heights.append(distance({"x": top[0], "y": top[1]}, {"x": bottom[0], "y": bottom[1]}))
+    eye_height = max(sum(heights) / float(max(len(heights), 1)), 1.0)
+    openness = eye_height / eye_width
+    box_w = max(10, int(round(eye_width * 1.22)))
+    box_h = max(5, int(round(max(eye_height * 2.1, eye_width * 0.18))))
+    local_x = clamp(int(round(center_x - x)), 0, max(w - 1, 0))
+    local_y = clamp(int(round(center_y - y)), 0, max(h - 1, 0))
+    box_x = clamp(int(round(local_x - box_w / 2.0)), 0, max(w - box_w, 0))
+    box_y = clamp(int(round(local_y - box_h / 2.0)), 0, max(h - box_h, 0))
+    closure_band = max(0.0, min(1.0, (0.26 - openness) / 0.20))
+    return {
+        "box": (int(box_x), int(box_y), int(box_w), int(box_h)),
+        "center": (float(local_x), float(local_y)),
+        "confidence": 0.86,
+        "aspect": round(float(eye_width / eye_height), 4),
+        "openness": round(float(openness), 4),
+        "bandConcentration": round(float(closure_band), 4),
+        "widthRatio": round(float(box_w / float(max(w, 1))), 4),
+        "reason": reason,
+    }
+
+
+def build_mediapipe_eye_support(bbox, landmarks, image_shape, current_metrics):
+    eyes = [
+        make_mediapipe_eye_candidate(
+            bbox,
+            landmarks,
+            (33, 133),
+            ((159, 145), (158, 153)),
+            image_shape,
+            "mediapipe-face-landmarker-left-eye",
+        ),
+        make_mediapipe_eye_candidate(
+            bbox,
+            landmarks,
+            (362, 263),
+            ((386, 374), (385, 380)),
+            image_shape,
+            "mediapipe-face-landmarker-right-eye",
+        ),
+    ]
+    eyes.sort(key=lambda item: item["center"][0])
+    avg_openness = sum(float(eye["openness"]) for eye in eyes) / float(max(len(eyes), 1))
+    avg_band = sum(float(eye["bandConcentration"]) for eye in eyes) / float(max(len(eyes), 1))
+    metrics = {**current_metrics}
+    metrics["closureScore"] = round(max(float(metrics.get("closureScore", 0.0)), avg_band), 4)
+    metrics["responseStrength"] = max(float(metrics.get("responseStrength", 0.0)), 0.28)
+    metrics["meanResponseStrength"] = max(float(metrics.get("meanResponseStrength", 0.0)), 0.24)
+    metrics["leftPeak"] = max(float(metrics.get("leftPeak", 0.0)), 0.28)
+    metrics["rightPeak"] = max(float(metrics.get("rightPeak", 0.0)), 0.28)
+    metrics["bilateralBalance"] = max(float(metrics.get("bilateralBalance", 0.0)), 0.82)
+    quality = round(float(0.72 + min(0.18, max(0.0, 0.24 - avg_openness))), 4)
+    return eyes, quality, "mediapipe-face-landmarker", metrics
+
+
+def build_yunet_eye_support(bbox, landmarks, current_metrics):
+    if len(landmarks) < 2:
+        return None
+    x, y, w, h = bbox
+    eye_points = sorted(landmarks[:2], key=lambda point: point[0])
+    eye_span = max(abs(eye_points[1][0] - eye_points[0][0]), 1.0)
+    eye_box_w = max(10, int(round(eye_span * 0.30)))
+    eye_box_h = max(5, int(round(eye_box_w * 0.42)))
+    eyes = []
+    for index, point in enumerate(eye_points):
+        local_x = clamp(int(round(point[0] - x)), 0, max(w - 1, 0))
+        local_y = clamp(int(round(point[1] - y)), 0, max(h - 1, 0))
+        eyes.append(
+            {
+                "box": (
+                    clamp(int(round(local_x - eye_box_w / 2.0)), 0, max(w - eye_box_w, 0)),
+                    clamp(int(round(local_y - eye_box_h / 2.0)), 0, max(h - eye_box_h, 0)),
+                    int(eye_box_w),
+                    int(eye_box_h),
+                ),
+                "center": (float(local_x), float(local_y)),
+                "confidence": 0.74,
+                "aspect": round(float(eye_box_w / float(max(eye_box_h, 1))), 4),
+                "openness": 0.42,
+                "bandConcentration": 0.0,
+                "widthRatio": round(float(eye_box_w / float(max(w, 1))), 4),
+                "reason": f"yunet-landmark-eye-{index + 1}",
+            }
+        )
+    metrics = {**current_metrics}
+    metrics["responseStrength"] = max(float(metrics.get("responseStrength", 0.0)), 0.22)
+    metrics["meanResponseStrength"] = max(float(metrics.get("meanResponseStrength", 0.0)), 0.18)
+    metrics["leftPeak"] = max(float(metrics.get("leftPeak", 0.0)), 0.22)
+    metrics["rightPeak"] = max(float(metrics.get("rightPeak", 0.0)), 0.22)
+    metrics["bilateralBalance"] = max(float(metrics.get("bilateralBalance", 0.0)), 0.72)
+    return eyes, 0.68, "yunet-face-detector-landmarks", metrics
+
+
 def build_projection_eye_candidates(face_gray, response_map):
     h, w = face_gray.shape[:2]
     upper_h = max(int(h * 0.52), 1)
@@ -556,6 +1025,44 @@ def build_projection_eye_candidates(face_gray, response_map):
         if candidate is not None:
             candidate["confidence"] = min(1.0, candidate["confidence"] * 0.92 + peak_score * 0.08)
             candidates.append(candidate)
+    return candidates
+
+
+def build_symmetric_peak_eye_candidates(face_gray, response_map, eye_metrics):
+    h, w = face_gray.shape[:2]
+    upper_h = max(int(h * 0.54), 1)
+    upper_map = response_map[:upper_h, :]
+    if upper_map.size == 0:
+        return []
+    if float(eye_metrics.get("bilateralBalance", 0.0)) < 0.78:
+        return []
+    if float(eye_metrics.get("responseStrength", 0.0)) < 0.16:
+        return []
+    if float(eye_metrics.get("closureScore", 0.0)) >= 0.52:
+        return []
+
+    candidates = []
+    eye_width = max(16, int(round(w * 0.17)))
+    eye_height = max(7, int(round(h * 0.09)))
+    for x1, x2, side_name in (
+        (int(w * 0.10), int(w * 0.46), "symmetric-peak-left"),
+        (int(w * 0.54), int(w * 0.90), "symmetric-peak-right"),
+    ):
+        band = upper_map[:, x1:x2]
+        if band.size == 0:
+            continue
+        best_index = int(np.argmax(band))
+        peak_row, peak_col = np.unravel_index(best_index, band.shape)
+        peak_score = float(band[peak_row, peak_col])
+        if peak_score < 0.18:
+            continue
+        box_x = clamp(x1 + peak_col - eye_width // 2, 0, max(w - eye_width, 0))
+        box_y = clamp(peak_row - eye_height // 2, 0, max(upper_h - eye_height, 0))
+        candidate = make_eye_candidate(face_gray, response_map, (box_x, box_y, eye_width, eye_height), side_name)
+        if candidate is None:
+            continue
+        candidate["confidence"] = min(0.76, candidate["confidence"] * 0.72 + peak_score * 0.28)
+        candidates.append(candidate)
     return candidates
 
 
@@ -627,8 +1134,8 @@ def build_eye_overlay_boxes(bbox, keypoints, pose_label):
     return boxes
 
 
-def detect_eye_candidates(face_gray):
-    response_map = build_eye_response(face_gray)
+def detect_eye_candidates(face_gray, face_mask=None):
+    response_map = build_eye_response(face_gray, face_mask)
     h, w = face_gray.shape[:2]
     candidates = []
     contour_candidates = contour_boxes(response_map, threshold=0.42) + contour_boxes(response_map, threshold=0.34)
@@ -653,6 +1160,14 @@ def detect_eye_candidates(face_gray):
         deduped.append(candidate)
 
     eye_metrics = summarize_eye_metrics(deduped, response_map)
+    if len(deduped) < 2:
+        candidates.extend(build_symmetric_peak_eye_candidates(face_gray, response_map, eye_metrics))
+        deduped = []
+        for candidate in sorted(candidates, key=lambda item: item["confidence"], reverse=True):
+            if any(calculate_iou(candidate["box"], existing["box"]) >= 0.35 for existing in deduped):
+                continue
+            deduped.append(candidate)
+        eye_metrics = summarize_eye_metrics(deduped, response_map)
     deduped.sort(key=lambda item: item["confidence"], reverse=True)
     return response_map, deduped, eye_metrics
 
@@ -698,8 +1213,10 @@ def select_eye_configuration(face_gray, candidates):
     return [best_single], float(best_single["confidence"]), "single-eye-detected"
 
 
-def build_face_edge_profile(face_gray):
+def build_face_edge_profile(face_gray, face_mask=None):
     edges = cv2.Canny(face_gray, 60, 140)
+    if face_mask is not None and face_mask.size:
+        edges = cv2.bitwise_and(edges, edges, mask=face_mask)
     h, w = face_gray.shape[:2]
     left_energy = float(np.count_nonzero(edges[:, : w // 2])) / max(1, (w // 2) * h)
     right_energy = float(np.count_nonzero(edges[:, w // 2 :])) / max(1, (w - w // 2) * h)
@@ -727,6 +1244,7 @@ def classify_pose(eye_selection, eye_quality, face_gray, edge_profile=None, eye_
         avg_conf = sum(eye["confidence"] for eye in eye_selection) / len(eye_selection)
         avg_openness = sum(eye["openness"] for eye in eye_selection) / len(eye_selection)
         avg_band = sum(eye.get("bandConcentration", 0.0) for eye in eye_selection) / len(eye_selection)
+        max_aspect = max(eye["aspect"] for eye in eye_selection)
         horizontal_gap = abs(eye_selection[1]["center"][0] - eye_selection[0]["center"][0]) / max(face_gray.shape[1], 1)
         if (avg_aspect >= 3.2 and avg_openness <= 0.18) or (avg_band >= 0.42 and avg_openness <= 0.42 and horizontal_gap >= 0.20 and horizontal_gap <= 0.46):
             return "eyes_closed", min(0.86, 0.56 + eye_quality * 0.26), "paired-flat-eye-structures"
@@ -734,6 +1252,10 @@ def classify_pose(eye_selection, eye_quality, face_gray, edge_profile=None, eye_
             return "occluded", 0.40, "paired-eye-gap-too-wide"
         symmetry_gap = abs(eye_selection[0]["center"][1] - eye_selection[1]["center"][1]) / max(face_gray.shape[0], 1)
         if symmetry_gap < 0.10:
+            if avg_openness <= 0.28 and avg_band >= 0.20:
+                return "eyes_closed", min(0.82, 0.54 + eye_quality * 0.24), "paired-low-openness-eye-structures"
+            if max_aspect >= 3.8 and avg_openness <= 0.34:
+                return "occluded", 0.46, "paired-eye-shapes-too-thin"
             return "frontal", min(1.0, 0.55 + eye_quality * 0.40), "paired-eye-symmetry"
         return "occluded", 0.48, "paired-eyes-but-low-symmetry"
     if len(eye_selection) == 1:
@@ -753,10 +1275,14 @@ def classify_pose(eye_selection, eye_quality, face_gray, edge_profile=None, eye_
             return "profile-left", 0.58 + eye_quality * 0.25, "single-eye-right-half"
         return "profile-right", 0.58 + eye_quality * 0.25, "single-eye-left-half"
     if min(left_peak, right_peak) >= 0.20 and bilateral_balance >= 0.70:
+        if eye_metrics["closureScore"] >= 0.18:
+            return "eyes_closed", 0.48 + min(0.22, eye_metrics["closureScore"]), "strong-balanced-eye-band-without-candidates"
         if eye_metrics["closureScore"] >= 0.12:
             return "eyes_closed", 0.44 + min(0.20, eye_metrics["closureScore"]), "balanced-eye-band-without-candidates"
         if abs(asymmetry) <= 0.010:
             return "occluded", 0.42 + min(0.12, eye_metrics["meanResponseStrength"]), "balanced-eye-band-fallback"
+    if eye_metrics["closureScore"] >= 0.18 and bilateral_balance >= 0.60 and abs(asymmetry) <= 0.020:
+        return "eyes_closed", 0.46 + min(0.22, eye_metrics["closureScore"]), "closed-eye-fallback-balanced"
     if eye_metrics["closureScore"] >= 0.22 and bilateral_balance >= 0.60 and abs(asymmetry) <= 0.020:
         return "eyes_closed", 0.42 + min(0.24, eye_metrics["closureScore"]), "closed-eye-fallback"
     if eye_metrics["responseStrength"] >= 0.20 and abs(asymmetry) <= 0.009:
@@ -789,8 +1315,8 @@ def global_box(local_box, bbox):
     return {"x": int(x + lx), "y": int(y + ly), "w": int(lw), "h": int(lh)}
 
 
-def detect_nose_keypoints(face_gray, bbox, pose):
-    response_map = build_nose_response(face_gray)
+def detect_nose_keypoints(face_gray, bbox, pose, face_mask=None):
+    response_map = build_nose_response(face_gray, face_mask)
     h, w = face_gray.shape[:2]
     row_start = int(h * 0.34)
     row_end = max(row_start + 1, int(h * 0.80))
@@ -831,8 +1357,8 @@ def detect_nose_keypoints(face_gray, bbox, pose):
     return response_map, nose_bridge_top, nose_tip
 
 
-def detect_mouth_keypoints(face_gray, bbox, pose):
-    response_map = build_mouth_response(face_gray)
+def detect_mouth_keypoints(face_gray, bbox, pose, face_mask=None):
+    response_map = build_mouth_response(face_gray, face_mask)
     h, w = face_gray.shape[:2]
     boxes = contour_boxes(response_map, threshold=0.40)
     best = None
@@ -941,6 +1467,64 @@ def build_keypoints(bbox, pose, eye_selection, nose_bridge_top, nose_tip, mouth_
     return keypoints
 
 
+def apply_mediapipe_keypoints(keypoints, bbox, pose, landmarks, image_shape):
+    if not landmarks:
+        return keypoints
+
+    image_h, image_w = image_shape[:2]
+    eye_a = average_mediapipe_points(landmarks, (33, 133, 159, 145), image_w, image_h)
+    eye_b = average_mediapipe_points(landmarks, (362, 263, 386, 374), image_w, image_h)
+    left_eye, right_eye = sorted([eye_a, eye_b], key=lambda point: point[0])
+    mouth_a = point_from_mediapipe_landmark(landmarks, 61, image_w, image_h)
+    mouth_b = point_from_mediapipe_landmark(landmarks, 291, image_w, image_h)
+    mouth_left, mouth_right = sorted([mouth_a, mouth_b], key=lambda point: point[0])
+
+    updates = {
+        "left_eye_center": left_eye,
+        "right_eye_center": right_eye,
+        "nose_bridge_top": point_from_mediapipe_landmark(landmarks, 168, image_w, image_h),
+        "nose_tip": point_from_mediapipe_landmark(landmarks, 1, image_w, image_h),
+        "mouth_left": mouth_left,
+        "mouth_center": average_mediapipe_points(landmarks, (13, 14), image_w, image_h),
+        "mouth_right": mouth_right,
+        "chin": point_from_mediapipe_landmark(landmarks, 152, image_w, image_h),
+        "forehead_center": point_from_mediapipe_landmark(landmarks, 10, image_w, image_h),
+    }
+    for name, point in updates.items():
+        keypoints[name] = make_keypoint(name, point, "detected", 0.88, "mediapipe-face-landmarker")
+    stabilize_profile_keypoints(bbox, pose, keypoints)
+    return keypoints
+
+
+def apply_yunet_keypoints(keypoints, bbox, pose, landmarks):
+    if len(landmarks) < 5:
+        return keypoints
+
+    eye_a, eye_b = sorted(landmarks[:2], key=lambda point: point[0])
+    mouth_a, mouth_b = sorted(landmarks[3:5], key=lambda point: point[0])
+    updates = {
+        "left_eye_center": eye_a,
+        "right_eye_center": eye_b,
+        "nose_tip": landmarks[2],
+        "mouth_left": mouth_a,
+        "mouth_center": (
+            int(round((mouth_a[0] + mouth_b[0]) / 2.0)),
+            int(round((mouth_a[1] + mouth_b[1]) / 2.0)),
+        ),
+        "mouth_right": mouth_b,
+    }
+    nose_bridge = keypoints.get("nose_bridge_top", {})
+    if nose_bridge:
+        updates["nose_bridge_top"] = (
+            int(round((updates["left_eye_center"][0] + updates["right_eye_center"][0]) / 2.0)),
+            int(round((updates["left_eye_center"][1] + updates["right_eye_center"][1]) / 2.0)),
+        )
+    for name, point in updates.items():
+        keypoints[name] = make_keypoint(name, point, "detected", 0.72, "yunet-face-detector-landmark")
+    stabilize_profile_keypoints(bbox, pose, keypoints)
+    return keypoints
+
+
 def stabilize_profile_keypoints(bbox, pose, keypoints):
     if pose not in {"profile-left", "profile-right"}:
         return
@@ -968,17 +1552,64 @@ def stabilize_profile_keypoints(bbox, pose, keypoints):
     keypoints["chin"]["y"] = max(keypoints["chin"]["y"], int(y + h * 0.88))
 
 
-def compute_noise_score(face_gray):
+def compute_noise_score(face_gray, face_mask=None):
     denoised = cv2.GaussianBlur(face_gray, (5, 5), 0)
     residual = cv2.absdiff(face_gray, denoised)
-    return float(np.mean(residual) / 255.0)
+    values = masked_values(residual, face_mask)
+    return float((np.mean(values) if values.size else 0.0) / 255.0)
+
+
+def compute_skin_ratio(face_bgr, face_mask=None):
+    if face_bgr.size == 0:
+        return 0.0
+    ycrcb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2YCrCb)
+    lower = np.array([0, 133, 77], dtype=np.uint8)
+    upper = np.array([255, 173, 127], dtype=np.uint8)
+    skin_mask = cv2.inRange(ycrcb, lower, upper)
+    if face_mask is not None and face_mask.size:
+        skin_mask = cv2.bitwise_and(skin_mask, skin_mask, mask=face_mask)
+        denom = max(1, int(np.count_nonzero(face_mask)))
+    else:
+        denom = max(1, skin_mask.size)
+    return float(np.count_nonzero(skin_mask) / float(denom))
+
+
+def compute_color_texture_features(face_bgr, face_mask=None):
+    if face_bgr.size == 0:
+        return {
+            "saturationMean": 0.0,
+            "saturationStd": 0.0,
+            "lowSaturationRatio": 0.0,
+            "highSaturationRatio": 0.0,
+            "chromaStd": 0.0,
+        }
+    if face_mask is not None and face_mask.size:
+        mask = face_mask > 0
+    else:
+        mask = np.ones(face_bgr.shape[:2], dtype=bool)
+    if not np.any(mask):
+        mask = np.ones(face_bgr.shape[:2], dtype=bool)
+
+    hsv = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2LAB)
+    saturation = hsv[:, :, 1][mask].astype(np.float32) / 255.0
+    lab_a = lab[:, :, 1][mask].astype(np.float32)
+    lab_b = lab[:, :, 2][mask].astype(np.float32)
+    chroma_std = (float(np.std(lab_a)) + float(np.std(lab_b))) / 2.0 if lab_a.size else 0.0
+    return {
+        "saturationMean": round(float(np.mean(saturation)) if saturation.size else 0.0, 4),
+        "saturationStd": round(float(np.std(saturation)) if saturation.size else 0.0, 4),
+        "lowSaturationRatio": round(float(np.mean(saturation < 0.08)) if saturation.size else 0.0, 4),
+        "highSaturationRatio": round(float(np.mean(saturation > 0.55)) if saturation.size else 0.0, 4),
+        "chromaStd": round(float(chroma_std), 4),
+    }
 
 
 def distance(point_a, point_b):
     return math.sqrt((point_a["x"] - point_b["x"]) ** 2 + (point_a["y"] - point_b["y"]) ** 2)
 
 
-def compute_deepfake_features(face_gray, bbox, keypoints, pose_label, eye_selection, edge_density, eye_metrics):
+def compute_deepfake_features(face_bgr, face_gray, bbox, keypoints, pose_label, eye_selection, edge_profile, eye_metrics, face_mask=None):
     w = max(float(bbox[2]), 1.0)
     h = max(float(bbox[3]), 1.0)
     left_eye = keypoints["left_eye_center"]
@@ -996,10 +1627,95 @@ def compute_deepfake_features(face_gray, bbox, keypoints, pose_label, eye_select
     signed_center_axis_bias = round((nose_tip["x"] - (bbox[0] + w / 2.0)) / w, 4)
     estimated_ratio = round(sum(1 for keypoint in keypoints.values() if keypoint["source"] != "detected") / float(max(len(keypoints), 1)), 4)
     eye_balance = round(abs(left_eye["y"] - right_eye["y"]) / h, 4)
-    edge_density = round(float(edge_density), 4)
-    noise_score = round(compute_noise_score(face_gray), 4)
+    edge_density = round(float(edge_profile.get("edgeDensity", 0.0)), 4)
+    edge_side_bias = round(float(edge_profile.get("rightEnergy", 0.0) - edge_profile.get("leftEnergy", 0.0)), 4)
+    noise_score = round(compute_noise_score(face_gray, face_mask), 4)
+    skin_ratio = round(compute_skin_ratio(face_bgr, face_mask), 4)
+    color_texture = compute_color_texture_features(face_bgr, face_mask)
     eye_visibility = round(len(eye_selection) / 2.0, 4)
     eye_closure_index = round(float(eye_metrics.get("closureScore", 0.0)), 4)
+    mean_eye_band = round(
+        sum(float(eye.get("bandConcentration", 0.0)) for eye in eye_selection) / float(max(len(eye_selection), 1)),
+        4,
+    ) if eye_selection else 0.0
+    mean_eye_openness = round(
+        sum(float(eye.get("openness", 0.0)) for eye in eye_selection) / float(max(len(eye_selection), 1)),
+        4,
+    ) if eye_selection else 0.0
+    face_mask_coverage = round(float(np.count_nonzero(face_mask)) / float(max(face_mask.size, 1)), 4) if face_mask is not None else 1.0
+    low_anchor_score = max(0.0, min(1.0, (0.78 - (1.0 - estimated_ratio)) / 0.67))
+    missing_eye_score = max(0.0, 1.0 - eye_visibility)
+    mask_gap_score = max(0.0, min(1.0, (0.70 - face_mask_coverage) / 0.20))
+    edge_score = max(0.0, min(1.0, edge_density / 0.16))
+    occlusion_score = round(
+        float(
+            0.34 * low_anchor_score
+            + 0.22 * estimated_ratio
+            + 0.18 * missing_eye_score
+            + 0.14 * edge_score
+            + 0.12 * mask_gap_score
+        ),
+        4,
+    )
+    moderate_anchor_occlusion = (
+        estimated_ratio >= 0.50
+        and eye_closure_index <= 0.12
+        and (
+            edge_density >= 0.075
+            or face_mask_coverage <= 0.68
+            or missing_eye_score >= 0.50
+        )
+    )
+    if moderate_anchor_occlusion:
+        occlusion_score = max(occlusion_score, 0.52)
+    if pose_label == "occluded":
+        occlusion_score = max(occlusion_score, 0.72)
+
+    low_openness_score = max(0.0, min(1.0, (0.30 - mean_eye_openness) / 0.30)) if eye_selection else 0.0
+    eye_closure_score = round(
+        float(max(eye_closure_index, 0.72 * eye_closure_index + 0.28 * low_openness_score)),
+        4,
+    )
+    if pose_label == "eyes_closed":
+        eye_closure_score = max(eye_closure_score, 0.72)
+
+    profile_pose_score = 0.0
+    if pose_label in {"profile-left", "profile-right"}:
+        profile_pose_score = 1.0
+    elif pose_label == "occluded":
+        profile_pose_score = 0.78
+    profile_axis_score = max(
+        profile_pose_score,
+        max(0.0, min(1.0, abs(signed_center_axis_bias) / 0.08)),
+        max(0.0, min(1.0, abs(edge_side_bias) / 0.10)),
+    )
+    profile_visibility_gap = max(missing_eye_score, estimated_ratio)
+    profile_eye_closure_score = eye_closure_score
+    if profile_axis_score >= 0.55:
+        profile_eye_closure_score = max(
+            profile_eye_closure_score,
+            0.56 * profile_axis_score
+            + 0.22 * profile_visibility_gap
+            + 0.12 * edge_score
+            + 0.10 * max(0.0, min(1.0, mean_eye_band / 0.30)),
+        )
+    if pose_label == "occluded" and occlusion_score >= 0.50:
+        profile_eye_closure_score = max(profile_eye_closure_score, 0.60)
+    if pose_label in {"profile-left", "profile-right"} and edge_density >= 0.10 and skin_ratio >= 0.45:
+        profile_eye_closure_score = max(profile_eye_closure_score, 0.58)
+    if pose_label == "frontal" and eye_visibility >= 1.0 and eye_closure_index < 0.08:
+        profile_eye_closure_score = min(profile_eye_closure_score, 0.34)
+    if (
+        pose_label == "frontal"
+        and eye_visibility >= 1.0
+        and eye_closure_index < 0.08
+        and occlusion_score >= 0.50
+        and edge_density >= 0.115
+        and 0.60 <= skin_ratio <= 0.82
+        and eye_distance_ratio >= 0.35
+    ):
+        profile_eye_closure_score = max(profile_eye_closure_score, 0.56)
+    profile_eye_closure_score = round(float(max(0.0, min(1.0, profile_eye_closure_score))), 4)
 
     return {
         "geometry": {
@@ -1013,13 +1729,26 @@ def compute_deepfake_features(face_gray, bbox, keypoints, pose_label, eye_select
         },
         "texture": {
             "edgeDensity": edge_density,
+            "edgeSideBias": edge_side_bias,
             "noiseScore": noise_score,
+            "skinRatio": skin_ratio,
+            "colorSaturationMean": color_texture["saturationMean"],
+            "colorSaturationStd": color_texture["saturationStd"],
+            "lowSaturationRatio": color_texture["lowSaturationRatio"],
+            "highSaturationRatio": color_texture["highSaturationRatio"],
+            "colorChromaStd": color_texture["chromaStd"],
         },
         "visibility": {
             "estimatedPointRatio": estimated_ratio,
             "eyeVisibility": eye_visibility,
             "eyeClosureIndex": eye_closure_index,
+            "meanEyeBandConcentration": mean_eye_band,
+            "meanEyeOpenness": mean_eye_openness,
+            "faceMaskCoverage": face_mask_coverage,
             "poseLabel": pose_label,
+            "occlusionScore": occlusion_score,
+            "eyeClosureScore": eye_closure_score,
+            "profileEyeClosureScore": profile_eye_closure_score,
         },
     }
 
@@ -1033,11 +1762,68 @@ def refine_pose_label(detector_name, detector_score, pose_label, pose_confidence
     eye_distance = float(geometry.get("eyeDistanceRatio", 0.0))
     eye_visibility = float(visibility.get("eyeVisibility", 0.0))
     closure_index = float(visibility.get("eyeClosureIndex", 0.0))
+    mean_eye_band = float(visibility.get("meanEyeBandConcentration", 0.0))
+    mean_eye_openness = float(visibility.get("meanEyeOpenness", 0.0))
     estimated_ratio = float(visibility.get("estimatedPointRatio", 1.0))
+    face_mask_coverage = float(visibility.get("faceMaskCoverage", 1.0))
     edge_density = float(texture.get("edgeDensity", 0.0))
+    edge_side_bias = float(texture.get("edgeSideBias", 0.0))
+    skin_ratio = float(texture.get("skinRatio", 0.0))
+    color_chroma_std = float(texture.get("colorChromaStd", 0.0))
     nose_bridge_x = float(keypoints.get("nose_bridge_top", {}).get("x", 0.0))
     nose_tip_x = float(keypoints.get("nose_tip", {}).get("x", 0.0))
     nose_direction = nose_tip_x - nose_bridge_x
+    nose_target_pose = None
+    if nose_direction >= 6.0:
+        nose_target_pose = "profile-left"
+    elif nose_direction <= -6.0:
+        nose_target_pose = "profile-right"
+
+    if (
+        pose_label == "frontal"
+        and detector_name.startswith("frontal")
+        and eye_visibility == 0.0
+        and 0.24 <= closure_index <= 0.46
+        and eye_distance <= 0.33
+        and center_offset <= 0.04
+        and abs(edge_side_bias) >= 0.05
+    ):
+        if nose_target_pose is not None:
+            return nose_target_pose, max(0.54, pose_confidence), "frontal-no-eye-closure-shifted-to-profile"
+        return "eyes_closed", max(0.54, pose_confidence), "frontal-no-eye-closure-promotion"
+
+    if (
+        pose_label == "frontal"
+        and detector_name.startswith("frontal")
+        and eye_visibility == 0.5
+        and 0.05 <= closure_index <= 0.12
+        and eye_distance >= 0.38
+        and center_offset <= 0.02
+    ):
+        return "eyes_closed", max(0.53, pose_confidence), "frontal-single-eye-closure-promotion"
+
+    if (
+        pose_label == "frontal"
+        and detector_name == "frontal_alt"
+        and eye_visibility >= 1.0
+        and 0.08 <= closure_index <= 0.12
+        and eye_distance <= 0.33
+        and face_mask_coverage <= 0.63
+        and center_offset <= 0.02
+    ):
+        return "occluded", max(0.52, pose_confidence), "frontal-paired-eyes-occlusion-suspected"
+
+    if (
+        pose_label == "frontal"
+        and detector_name == "frontal_alt"
+        and eye_visibility >= 1.0
+        and mean_eye_band >= 0.23
+        and mean_eye_openness >= 0.50
+        and eye_distance <= 0.34
+        and face_mask_coverage <= 0.67
+        and center_offset <= 0.04
+    ):
+        return "occluded", max(0.53, pose_confidence), "frontal-paired-eyes-high-band-occlusion"
 
     if (
         pose_label in {"profile-left", "profile-right", "occluded"}
@@ -1046,6 +1832,12 @@ def refine_pose_label(detector_name, detector_score, pose_label, pose_confidence
         and center_offset <= 0.035
         and 0.23 <= eye_distance <= 0.42
         and eye_visibility >= 0.5
+        and not (
+            pose_label == "occluded"
+            and eye_visibility == 0.5
+            and closure_index >= 0.05
+            and eye_distance >= 0.38
+        )
     ):
         return "frontal", max(0.58, pose_confidence), "frontal-detector-centered-nose"
 
@@ -1057,10 +1849,105 @@ def refine_pose_label(detector_name, detector_score, pose_label, pose_confidence
         and estimated_ratio >= 0.70
         and eye_distance <= 0.30
         and abs(nose_direction) <= 12.0
+        and not (
+            pose_label in {"profile-left", "profile-right"}
+            and closure_index >= 0.24
+            and abs(edge_side_bias) >= 0.05
+        )
     ):
         if closure_index >= 0.55 or (closure_index >= 0.45 and edge_density <= 0.20):
             return "eyes_closed", max(0.56, pose_confidence), "strong-frontal-detector-no-eye-closure-bias"
         return "frontal", max(0.54, pose_confidence), "strong-frontal-detector-no-eye-bias"
+
+    if (
+        pose_label == "eyes_closed"
+        and detector_name == "frontal_alt"
+        and eye_visibility == 0.0
+        and estimated_ratio >= 0.77
+        and center_offset <= 0.035
+        and abs(nose_direction) <= 8.0
+        and 0.60 <= face_mask_coverage <= 0.74
+        and 0.08 <= edge_density <= 0.16
+        and closure_index >= 0.68
+    ):
+        return "frontal", max(0.50, pose_confidence), "frontal-alt-high-closure-open-eye-bias"
+
+    if (
+        pose_label == "occluded"
+        and detector_name.startswith("frontal")
+        and eye_visibility == 0.0
+        and closure_index >= 0.18
+        and center_offset <= 0.055
+        and abs(nose_direction) <= 10.0
+    ):
+        return "eyes_closed", max(0.50, pose_confidence), "frontal-occluded-promoted-to-eyes-closed"
+
+    if (
+        pose_label == "occluded"
+        and detector_name.startswith("frontal")
+        and eye_visibility == 0.5
+        and closure_index >= 0.05
+        and eye_distance >= 0.38
+        and center_offset <= 0.02
+    ):
+        return "eyes_closed", max(0.52, pose_confidence), "frontal-single-eye-occluded-promoted-to-eyes-closed"
+
+    if (
+        pose_label == "eyes_closed"
+        and eye_visibility == 0.0
+        and center_offset <= 0.035
+        and closure_index >= 0.34
+        and abs(edge_side_bias) >= 0.035
+    ):
+        if edge_side_bias <= -0.035:
+            return "profile-right", max(0.52, pose_confidence), "eyes-closed-demoted-to-profile-right-by-edge-bias"
+        return "profile-left", max(0.52, pose_confidence), "eyes-closed-demoted-to-profile-left-by-edge-bias"
+
+    if (
+        pose_label == "occluded"
+        and eye_visibility == 0.0
+        and center_offset <= 0.04
+        and closure_index >= 0.18
+        and abs(edge_side_bias) >= 0.04
+    ):
+        if edge_side_bias <= -0.04:
+            return "profile-right", max(0.50, pose_confidence), "occluded-demoted-to-profile-right-by-edge-bias"
+        return "profile-left", max(0.50, pose_confidence), "occluded-demoted-to-profile-left-by-edge-bias"
+
+    if (
+        pose_label == "frontal"
+        and detector_name in {"frontal_alt", "response_fallback"}
+        and eye_visibility >= 0.5
+        and closure_index <= 0.10
+        and 0.04 <= center_offset <= 0.08
+        and abs(edge_side_bias) >= 0.04
+    ):
+        if nose_target_pose is not None and eye_distance <= 0.36:
+            return nose_target_pose, max(0.52, pose_confidence), "frontal-demoted-to-profile-by-nose-direction"
+        if edge_side_bias <= -0.04:
+            return "profile-right", max(0.50, pose_confidence), "frontal-demoted-to-profile-right-by-edge-bias"
+        return "profile-left", max(0.50, pose_confidence), "frontal-demoted-to-profile-left-by-edge-bias"
+
+    if (
+        pose_label == "frontal"
+        and detector_name.startswith("frontal")
+        and eye_visibility >= 0.5
+        and closure_index <= 0.08
+        and 0.035 <= center_offset <= 0.09
+        and eye_distance <= 0.36
+        and nose_target_pose is not None
+    ):
+        return nose_target_pose, max(0.51, pose_confidence), "frontal-shifted-to-profile-by-nose-direction"
+
+    if (
+        pose_label == "frontal"
+        and detector_name.startswith("frontal")
+        and eye_visibility == 0.0
+        and closure_index >= 0.20
+        and center_offset <= 0.050
+        and abs(nose_direction) <= 12.0
+    ):
+        return "eyes_closed", max(0.52, pose_confidence), "frontal-no-eye-closure-promotion"
 
     if pose_label == "eyes_closed" and eye_visibility == 0.0:
         if abs(signed_center_bias) >= 0.090:
@@ -1077,13 +1964,13 @@ def refine_pose_label(detector_name, detector_score, pose_label, pose_confidence
             return "occluded", max(0.48, pose_confidence), "eyes-closed-demoted-to-occluded-by-texture"
         if center_offset >= 0.10:
             if nose_direction > 0:
-                return "profile-right", max(0.52, pose_confidence), "eyes-closed-demoted-to-profile-right"
-            if nose_direction < 0:
                 return "profile-left", max(0.52, pose_confidence), "eyes-closed-demoted-to-profile-left"
+            if nose_direction < 0:
+                return "profile-right", max(0.52, pose_confidence), "eyes-closed-demoted-to-profile-right"
         if center_offset >= 0.04 and abs(nose_direction) >= 6.0:
             if nose_direction > 0:
-                return "profile-right", max(0.50, pose_confidence), "eyes-closed-shifted-to-profile-right"
-            return "profile-left", max(0.50, pose_confidence), "eyes-closed-shifted-to-profile-left"
+                return "profile-left", max(0.50, pose_confidence), "eyes-closed-shifted-to-profile-left"
+            return "profile-right", max(0.50, pose_confidence), "eyes-closed-shifted-to-profile-right"
         if detector_name == "response_fallback" and closure_index < 0.55 and edge_density >= 0.16:
             return "occluded", max(0.46, pose_confidence), "response-fallback-eyes-closed-demoted-to-occluded"
 
@@ -1093,6 +1980,17 @@ def refine_pose_label(detector_name, detector_score, pose_label, pose_confidence
         if eye_visibility >= 1.0 and eye_distance <= 0.31 and closure_index <= 0.10:
             return "eyes_closed", max(0.54, pose_confidence), "frontal-paired-eyes-tight-spacing"
 
+    if (
+        pose_label == "frontal"
+        and detector_name.startswith("frontal")
+        and eye_visibility == 0.5
+        and closure_index <= 0.10
+        and abs(signed_center_bias) >= 0.020
+    ):
+        if signed_center_bias > 0:
+            return "profile-right", max(0.50, pose_confidence), "frontal-single-eye-shifted-to-profile-right"
+        return "profile-left", max(0.50, pose_confidence), "frontal-single-eye-shifted-to-profile-left"
+
     if pose_label == "frontal" and abs(signed_center_bias) >= 0.085 and eye_visibility <= 0.5:
         if signed_center_bias > 0:
             return "profile-right", max(0.50, pose_confidence), "frontal-demoted-to-profile-right-by-bias"
@@ -1100,13 +1998,50 @@ def refine_pose_label(detector_name, detector_score, pose_label, pose_confidence
 
     if eye_visibility == 0.0 and abs(nose_direction) >= 10.0 and center_offset >= 0.06:
         if nose_direction > 0:
-            return "profile-right", max(0.52, pose_confidence), "nose-direction-right"
-        return "profile-left", max(0.52, pose_confidence), "nose-direction-left"
+            return "profile-left", max(0.52, pose_confidence), "nose-direction-left"
+        return "profile-right", max(0.52, pose_confidence), "nose-direction-right"
 
     if pose_label == "occluded" and eye_visibility == 0.0 and abs(nose_direction) >= 8.0 and center_offset >= 0.05:
         if nose_direction > 0:
-            return "profile-right", max(0.50, pose_confidence), "occluded-to-profile-right-by-nose"
-        return "profile-left", max(0.50, pose_confidence), "occluded-to-profile-left-by-nose"
+            return "profile-left", max(0.50, pose_confidence), "occluded-to-profile-left-by-nose"
+        return "profile-right", max(0.50, pose_confidence), "occluded-to-profile-right-by-nose"
+
+    if (
+        pose_label == "occluded"
+        and eye_visibility == 0.5
+        and closure_index <= 0.08
+        and signed_center_bias <= -0.025
+        and detector_name.startswith("frontal")
+    ):
+        return "profile-left", max(0.50, pose_confidence), "occluded-single-eye-promoted-to-profile-left"
+
+    if pose_label == "profile-left" and signed_center_bias >= 0.10 and center_offset >= 0.08:
+        return "profile-right", max(0.52, pose_confidence), "profile-left-flipped-to-profile-right-by-bias"
+
+    if pose_label == "profile-right" and signed_center_bias <= -0.10 and center_offset >= 0.08:
+        return "profile-left", max(0.52, pose_confidence), "profile-right-flipped-to-profile-left-by-bias"
+
+    if pose_label == "profile-left" and edge_side_bias <= -0.08 and center_offset >= 0.06:
+        return "profile-right", max(0.50, pose_confidence), "profile-left-flipped-to-profile-right-by-edge-bias"
+
+    if pose_label == "profile-right" and edge_side_bias >= 0.08 and center_offset >= 0.06:
+        return "profile-left", max(0.50, pose_confidence), "profile-right-flipped-to-profile-left-by-edge-bias"
+
+    if pose_label == "profile-left" and nose_direction <= -12.0 and center_offset >= 0.05 and eye_visibility <= 0.5:
+        return "profile-right", max(0.50, pose_confidence), "profile-left-corrected-by-nose-direction"
+
+    if pose_label == "profile-right" and nose_direction >= 12.0 and center_offset >= 0.05 and eye_visibility <= 0.5:
+        return "profile-left", max(0.50, pose_confidence), "profile-right-corrected-by-nose-direction"
+
+    if (
+        pose_label in {"profile-left", "profile-right"}
+        and nose_target_pose is not None
+        and pose_label != nose_target_pose
+        and eye_visibility <= 0.5
+        and closure_index <= 0.20
+        and center_offset <= 0.06
+    ):
+        return nose_target_pose, max(0.54, pose_confidence), "profile-flipped-by-nose-direction"
 
     return pose_label, pose_confidence, pose_reason
 
@@ -1197,29 +2132,40 @@ def build_training_sample(face):
     }
 
 
-def save_face_crop(image, request_uid, face_index, box):
-    x, y, w, h = expand_box(box, image.shape, scale=0.20)
-    face_crop = image[y : y + h, x : x + w]
+def save_face_crop(image, request_uid, face_index, box, face_mask=None):
+    if not DEBUG_ARTIFACTS:
+        return None
+    x, y, w, h = box
+    face_crop = image[y : y + h, x : x + w].copy()
     if face_crop.size == 0:
         return None
+    if face_mask is not None and face_mask.size:
+        resized_mask = face_mask if face_mask.shape[:2] == face_crop.shape[:2] else cv2.resize(face_mask, (face_crop.shape[1], face_crop.shape[0]), interpolation=cv2.INTER_NEAREST)
+        masked_crop = np.zeros_like(face_crop)
+        masked_crop[resized_mask > 0] = face_crop[resized_mask > 0]
+        face_crop = masked_crop
     crop_path = os.path.join(FACE_CROP_DIR, f"{request_uid}_face_{face_index + 1}.jpg")
     cv2.imwrite(crop_path, face_crop)
     return normalize_path(crop_path)
 
 
-def compute_blur_score(face_gray):
-    variance = cv2.Laplacian(face_gray, cv2.CV_64F).var()
+def compute_blur_score(face_gray, face_mask=None):
+    laplacian = cv2.Laplacian(face_gray, cv2.CV_64F)
+    values = masked_values(laplacian, face_mask)
+    variance = float(np.var(values)) if values.size else 0.0
     return round(float(max(0.0, min(1.0, variance / 220.0))), 4)
 
 
-def compute_brightness_score(face_gray):
-    mean_value = float(np.mean(face_gray))
+def compute_brightness_score(face_gray, face_mask=None):
+    values = masked_values(face_gray, face_mask)
+    mean_value = float(np.mean(values)) if values.size else 0.0
     deviation = abs(mean_value - 128.0)
     return round(float(max(0.0, min(1.0, 1.0 - deviation / 128.0))), 4)
 
 
-def compute_contrast_score(face_gray):
-    std_value = float(np.std(face_gray))
+def compute_contrast_score(face_gray, face_mask=None):
+    values = masked_values(face_gray, face_mask)
+    std_value = float(np.std(values)) if values.size else 0.0
     return round(float(max(0.0, min(1.0, std_value / 72.0))), 4)
 
 
@@ -1230,6 +2176,53 @@ def classify_quality(blur_score, brightness_score, contrast_score, pose_confiden
     if weighted_score >= 0.48:
         return "usable", round(weighted_score, 4)
     return "poor", round(weighted_score, 4)
+
+
+def compute_face_like_score(face):
+    quality = face.get("quality", {})
+    deepfake_features = face.get("deepfakeFeatures", {})
+    geometry = deepfake_features.get("geometry", {})
+    texture = deepfake_features.get("texture", {})
+    visibility = deepfake_features.get("visibility", {})
+    feature_summary = face.get("featureSummary", {})
+
+    eye_support = min(1.0, float(visibility.get("eyeVisibility", 0.0)))
+    anchor_support = min(1.0, float(quality.get("detectedPointRatio", 0.0)) / 0.55)
+    mouth_support = min(1.0, float(feature_summary.get("mouthEvidence", 0.0)))
+    nose_support = min(1.0, float(feature_summary.get("noseEvidence", 0.0)))
+
+    skin_ratio = float(texture.get("skinRatio", 0.0))
+    skin_support = max(0.0, 1.0 - abs(skin_ratio - 0.55) / 0.55) if skin_ratio > 0.0 else 0.0
+
+    edge_density = float(texture.get("edgeDensity", 0.0))
+    edge_support = max(0.0, 1.0 - abs(edge_density - 0.13) / 0.13)
+
+    eye_distance_ratio = float(geometry.get("eyeDistanceRatio", 0.0))
+    geometry_support = max(0.0, 1.0 - abs(eye_distance_ratio - 0.34) / 0.34)
+
+    detector_support = {
+        "mediapipe_landmarker": 0.78,
+        "mediapipe": 0.72,
+        "yunet": 0.70,
+        "frontal_alt": 0.66,
+        "frontal": 0.54,
+        "profile": 0.50,
+        "response_fallback": 0.35,
+    }.get(face.get("detector"), 0.40)
+
+    return round(
+        float(
+            0.26 * eye_support
+            + 0.17 * anchor_support
+            + 0.16 * mouth_support
+            + 0.12 * nose_support
+            + 0.11 * skin_support
+            + 0.08 * edge_support
+            + 0.06 * geometry_support
+            + 0.04 * detector_support
+        ),
+        4,
+    )
 
 
 def should_keep_face(face):
@@ -1243,20 +2236,110 @@ def should_keep_face(face):
     geometry = deepfake_features.get("geometry", {})
     texture = deepfake_features.get("texture", {})
     visibility = deepfake_features.get("visibility", {})
+    face_like_score = float(face.get("faceLikeScore", 0.0))
 
     detected_eye_count = sum(1 for key in ("left_eye_center", "right_eye_center") if face["keypoints"][key]["source"] == "detected")
     eye_visibility = float(visibility.get("eyeVisibility", 0.0))
     estimated_ratio = float(visibility.get("estimatedPointRatio", 1.0))
     closure_index = float(visibility.get("eyeClosureIndex", 0.0))
+    face_mask_coverage = float(visibility.get("faceMaskCoverage", 1.0))
     center_offset = float(geometry.get("centerAxisOffset", 1.0))
     edge_density = float(texture.get("edgeDensity", 0.0))
+    edge_side_bias = float(texture.get("edgeSideBias", 0.0))
+    skin_ratio = float(texture.get("skinRatio", 0.0))
+    color_chroma_std = float(texture.get("colorChromaStd", 0.0))
+    mouth_evidence = float(face.get("featureSummary", {}).get("mouthEvidence", 0.0))
+    strong_rescue_face = (
+        face_like_score >= 0.80
+        and skin_ratio >= 0.88
+        and mouth_evidence >= 0.55
+        and color_chroma_std >= 7.0
+        and eye_visibility >= 1.0
+        and quality.get("detectedPointRatio", 0.0) >= 0.75
+    )
+    nose_bridge_x = float(face["keypoints"].get("nose_bridge_top", {}).get("x", 0.0))
+    nose_tip_x = float(face["keypoints"].get("nose_tip", {}).get("x", 0.0))
+    nose_direction = nose_tip_x - nose_bridge_x
+    left_eye_reason = face["keypoints"].get("left_eye_center", {}).get("reason", "")
+    right_eye_reason = face["keypoints"].get("right_eye_center", {}).get("reason", "")
+    bbox_x = float(bbox["x"])
+    bbox_y = float(bbox["y"])
+    width_f = float(max(width, 1))
+    height_f = float(max(height, 1))
+    left_eye_y = float(face["keypoints"].get("left_eye_center", {}).get("y", bbox_y))
+    right_eye_y = float(face["keypoints"].get("right_eye_center", {}).get("y", bbox_y))
+    mouth_y = float(face["keypoints"].get("mouth_center", {}).get("y", bbox_y))
+    eye_span = abs(float(face["keypoints"].get("right_eye_center", {}).get("x", bbox_x)) - float(face["keypoints"].get("left_eye_center", {}).get("x", bbox_x))) / width_f
+    eye_y_ratio = (((left_eye_y + right_eye_y) / 2.0) - bbox_y) / height_f
+    nose_y_ratio = (float(face["keypoints"].get("nose_tip", {}).get("y", bbox_y)) - bbox_y) / height_f
+    mouth_y_ratio = (mouth_y - bbox_y) / height_f
+    nose_to_mouth_ratio = (mouth_y - float(face["keypoints"].get("nose_tip", {}).get("y", bbox_y))) / height_f
+
+    if (
+        face.get("detector") == "mediapipe_landmarker"
+        and (closure_index < 0.85 or skin_ratio < 0.70)
+        and not strong_rescue_face
+    ):
+        return False, "mediapipe-landmarker-rescue-requires-high-closure-and-skin-support"
+    if (
+        face.get("detector") == "yunet"
+        and (
+            not strong_rescue_face
+            and (
+                face_like_score < 0.76
+                or skin_ratio < 0.40
+                or mouth_evidence < 0.25
+                or (
+                    closure_index < 0.85
+                    and center_offset < 0.16
+                    and abs(edge_side_bias) < 0.045
+                )
+            )
+        )
+    ):
+        return False, "yunet-rescue-requires-strong-face-like-skin-mouth-support"
 
     if score < 0.05:
         return False, "very-low-detector-score"
+    if (
+        face_like_score < 0.68
+        and face.get("detector") in {"response_fallback", "frontal_alt"}
+        and eye_visibility >= 1.0
+        and face.get("featureSummary", {}).get("mouthEvidence", 0.0) <= 0.30
+        and edge_density <= 0.09
+    ):
+        return False, "low-face-like-score-with-weak-mouth-texture"
+    if (
+        face.get("detector") == "frontal"
+        and score < 0.08
+        and eye_visibility == 0.0
+        and quality.get("detectedPointRatio", 0.0) <= 0.2222
+    ):
+        return False, "frontal-low-score-without-eye-support"
+    if (
+        face.get("detector") == "frontal_alt"
+        and eye_visibility == 0.0
+        and quality.get("detectedPointRatio", 0.0) <= 0.2222
+        and edge_density <= 0.115
+        and skin_ratio <= 0.22
+    ):
+        return False, "frontal-alt-low-support-low-skin"
     if score < 0.16 and min(width, height) < 72 and detected_eye_count == 0:
         return False, "small-low-score-without-eyes"
     if face.get("detector") == "profile" and score < 0.19 and eye_visibility == 0.0 and quality.get("detectedPointRatio", 0.0) <= 0.2222:
         return False, "weak-profile-candidate-without-eyes"
+    if (
+        face.get("detector") == "response_fallback"
+        and center_offset <= 0.04
+        and float(texture.get("noiseScore", 0.0)) >= 0.04
+    ):
+        return False, "response-fallback-centered-noisy-nonphotoreal"
+    if (
+        face.get("detector") == "response_fallback"
+        and color_chroma_std >= 20.0
+        and skin_ratio <= 0.35
+    ):
+        return False, "response-fallback-high-chroma-nonphotoreal"
     if (
         face.get("detector") == "response_fallback"
         and eye_visibility == 0.0
@@ -1264,11 +2347,120 @@ def should_keep_face(face):
         and quality.get("detectedPointRatio", 0.0) <= 0.2222
         and center_offset <= 0.08
         and edge_density <= 0.16
+        and not (
+            pose_label in {"profile-left", "profile-right"}
+            and abs(edge_side_bias) >= 0.04
+            and closure_index <= 0.45
+        )
+        and not (
+            pose_label in {"profile-left", "profile-right"}
+            and abs(edge_side_bias) >= 0.035
+            and closure_index >= 0.55
+            and center_offset <= 0.05
+        )
     ):
         return False, "response-fallback-without-visible-features"
     if face.get("detector") == "response_fallback" and center_offset >= 0.16 and detected_eye_count == 0:
         return False, "response-fallback-off-axis-face"
-    if face.get("detector", "").startswith("frontal") and eye_visibility == 0.0 and estimated_ratio >= 0.77 and edge_density <= 0.11 and quality.get("detectedPointRatio", 0.0) <= 0.2222:
+    if (
+        face.get("detector") == "response_fallback"
+        and pose_label == "eyes_closed"
+        and face.get("featureSummary", {}).get("eyeReason") == "no-eye-candidate"
+        and closure_index >= 0.55
+        and edge_density <= 0.12
+        and center_offset <= 0.05
+        and quality.get("detectedPointRatio", 0.0) <= 0.4444
+    ):
+        return False, "response-fallback-eyes-closed-without-eye-support"
+    if (
+        face.get("detector") == "response_fallback"
+        and pose_label in {"eyes_closed", "profile-left", "profile-right"}
+        and face.get("featureSummary", {}).get("eyeReason") == "no-eye-candidate"
+        and quality.get("detectedPointRatio", 0.0) <= 0.1111
+        and edge_density <= 0.19
+        and closure_index >= 0.34
+    ):
+        return False, "response-fallback-low-structure-no-eye-candidate"
+    if (
+        face.get("detector") == "frontal_alt"
+        and pose_label == "eyes_closed"
+        and face.get("featureSummary", {}).get("eyeReason") == "no-eye-candidate"
+        and quality.get("detectedPointRatio", 0.0) <= 0.1111
+        and eye_visibility == 0.0
+    ):
+        return False, "frontal-alt-eyes-closed-with-too-few-detected-points"
+    if (
+        face.get("detector") == "frontal_alt"
+        and pose_label == "eyes_closed"
+        and face.get("featureSummary", {}).get("eyeReason") == "no-eye-candidate"
+        and quality.get("detectedPointRatio", 0.0) <= 0.2222
+        and eye_visibility == 0.0
+        and closure_index >= 0.72
+        and edge_density <= 0.13
+        and center_offset <= 0.03
+        and 0.60 <= face_mask_coverage <= 0.72
+        and min(width, height) <= 138
+    ):
+        return False, "frontal-alt-small-high-closure-no-eye-candidate"
+    if (
+        face.get("detector") == "frontal_alt"
+        and pose_label == "frontal"
+        and eye_visibility >= 1.0
+        and quality.get("detectedPointRatio", 0.0) <= 0.4444
+        and closure_index >= 0.16
+        and edge_density <= 0.08
+    ):
+        return False, "frontal-alt-paired-eyes-low-texture"
+    if (
+        face.get("detector") == "frontal_alt"
+        and pose_label == "frontal"
+        and eye_visibility == 0.5
+        and quality.get("detectedPointRatio", 0.0) <= 0.3333
+        and closure_index <= 0.12
+        and edge_density <= 0.13
+        and ("mirrored-eye" in left_eye_reason or "mirrored-eye" in right_eye_reason)
+        and not (
+            abs(nose_direction) >= 6.0
+            and 0.25 <= skin_ratio <= 0.75
+            and center_offset <= 0.03
+        )
+        and not (
+            0.35 <= skin_ratio <= 0.65
+            and center_offset <= 0.03
+            and edge_density >= 0.105
+        )
+    ):
+        return False, "frontal-alt-single-eye-mirror-low-structure"
+    if (
+        face.get("detector") == "response_fallback"
+        and pose_label in {"profile-left", "profile-right"}
+        and eye_visibility == 0.0
+        and quality.get("detectedPointRatio", 0.0) <= 0.2222
+        and center_offset <= 0.10
+        and abs(nose_direction) < 10.0
+        and abs(edge_side_bias) < 0.04
+    ):
+        return False, "response-fallback-profile-without-nose-direction"
+    if (
+        face.get("detector") == "response_fallback"
+        and pose_label in {"profile-left", "profile-right"}
+        and eye_visibility <= 0.5
+        and quality.get("detectedPointRatio", 0.0) <= 0.3333
+        and closure_index <= 0.08
+        and edge_density <= 0.08
+    ):
+        return False, "response-fallback-profile-low-structure"
+    if (
+        face.get("detector") == "frontal_alt"
+        and pose_label == "profile-left"
+        and face.get("featureSummary", {}).get("eyeReason") == "no-eye-candidate"
+        and closure_index >= 0.60
+        and 0.05 <= center_offset <= 0.09
+        and edge_density <= 0.12
+        and quality.get("detectedPointRatio", 0.0) <= 0.2222
+    ):
+        return False, "frontal-alt-profile-left-without-eye-support"
+    if face.get("detector", "").startswith("frontal") and eye_visibility == 0.0 and estimated_ratio >= 0.77 and edge_density <= 0.11 and quality.get("detectedPointRatio", 0.0) <= 0.2222 and closure_index < 0.16:
         return False, "frontal-face-without-eyes-and-low-structure"
     if (
         pose_label == "eyes_closed"
@@ -1286,6 +2478,49 @@ def should_keep_face(face):
         and quality.get("detectedPointRatio", 0.0) >= 0.75
     ):
         return False, "low-texture-response-fallback-face"
+    if (
+        face.get("detector") in {"response_fallback", "frontal_alt"}
+        and pose_label in {"frontal", "eyes_closed"}
+        and face.get("featureSummary", {}).get("eyeReason") == "pair-detected"
+        and quality.get("detectedPointRatio", 0.0) <= 0.4444
+        and closure_index <= 0.08
+        and edge_density <= 0.12
+        and "symmetric-peak" in left_eye_reason
+        and "symmetric-peak" in right_eye_reason
+        and not (
+            face.get("detector") == "frontal_alt"
+            and skin_ratio >= 0.39
+            and center_offset <= 0.05
+            and score >= 0.996
+        )
+    ):
+        return False, "symmetric-peak-pair-with-low-texture"
+    if (
+        face.get("detector") == "frontal_alt"
+        and pose_label == "frontal"
+        and eye_visibility >= 1.0
+        and quality.get("detectedPointRatio", 0.0) <= 0.4444
+        and closure_index <= 0.12
+    ):
+        anthropometric_flags = 0
+        if eye_span < 0.315:
+            anthropometric_flags += 1
+        if nose_y_ratio < 0.50 or nose_y_ratio > 0.675:
+            anthropometric_flags += 1
+        if mouth_y_ratio < 0.71:
+            anthropometric_flags += 1
+        if nose_to_mouth_ratio > 0.27:
+            anthropometric_flags += 1
+        if skin_ratio < 0.22 and edge_density < 0.12:
+            anthropometric_flags += 1
+        likely_profile_human = (
+            skin_ratio >= 0.88
+            and eye_span >= 0.33
+            and nose_y_ratio <= 0.42
+            and nose_to_mouth_ratio >= 0.34
+        )
+        if anthropometric_flags >= 2 and not likely_profile_human:
+            return False, "frontal-alt-anthropometric-outlier"
     if quality["label"] == "poor" and min(width, height) < 64 and texture.get("edgeDensity", 0.0) < 0.03:
         return False, "small-poor-low-edge-face"
     if geometry.get("eyeDistanceRatio", 0.0) > 0.78 and visibility.get("eyeClosureIndex", 0.0) < 0.35:
@@ -1293,17 +2528,168 @@ def should_keep_face(face):
     return True, "accepted"
 
 
+def refine_face_label_after_quality(face):
+    pose = face.get("pose", {})
+    quality = face.get("quality", {})
+    deepfake_features = face.get("deepfakeFeatures", {})
+    geometry = deepfake_features.get("geometry", {})
+    texture = deepfake_features.get("texture", {})
+    visibility = deepfake_features.get("visibility", {})
+
+    pose_label = pose.get("label", "")
+    detected_ratio = float(quality.get("detectedPointRatio", 0.0))
+    eye_visibility = float(visibility.get("eyeVisibility", 0.0))
+    signed_center_bias = float(geometry.get("signedCenterAxisBias", 0.0))
+    edge_density = float(texture.get("edgeDensity", 0.0))
+
+    if (
+        pose_label == "frontal"
+        and face.get("detector") == "yunet"
+        and abs(signed_center_bias) >= 0.16
+    ):
+        pose_label = "profile-right" if signed_center_bias > 0 else "profile-left"
+        pose["label"] = pose_label
+        pose["confidence"] = max(float(pose.get("confidence", 0.0)), 0.56)
+        pose["reason"] = "yunet-rescue-profile-by-center-bias"
+        face["faceMode"] = pose_label
+
+    if (
+        pose_label == "frontal"
+        and abs(signed_center_bias) >= 0.055
+        and (eye_visibility <= 0.5 or detected_ratio <= 0.4445)
+    ):
+        pose_label = "profile-right" if signed_center_bias > 0 else "profile-left"
+        pose["label"] = pose_label
+        pose["confidence"] = max(float(pose.get("confidence", 0.0)), 0.52)
+        pose["reason"] = "postprocess-profile-by-center-bias"
+        face["faceMode"] = pose_label
+
+    if (
+        pose_label == "frontal"
+        and eye_visibility <= 0.5
+        and detected_ratio <= 0.3334
+        and edge_density >= 0.09
+    ):
+        pose["label"] = "occluded"
+        pose["confidence"] = max(float(pose.get("confidence", 0.0)), 0.52)
+        pose["reason"] = "postprocess-occluded-low-anchor-visibility"
+        face["faceMode"] = "occluded"
+
+    apply_profile_direction_voting(face)
+
+
+def apply_profile_direction_voting(face):
+    pose = face.get("pose", {})
+    pose_label = pose.get("label", "")
+    if pose_label not in {"profile-left", "profile-right"}:
+        return
+
+    deepfake_features = face.get("deepfakeFeatures", {})
+    geometry = deepfake_features.get("geometry", {})
+    visibility = deepfake_features.get("visibility", {})
+    keypoints = face.get("keypoints", {})
+    if float(pose.get("confidence", 0.0)) >= 0.75 and float(visibility.get("eyeVisibility", 0.0)) >= 1.0:
+        return
+
+    signed_center_bias = float(geometry.get("signedCenterAxisBias", 0.0))
+    nose_bridge_x = float(keypoints.get("nose_bridge_top", {}).get("x", 0.0))
+    nose_tip_x = float(keypoints.get("nose_tip", {}).get("x", 0.0))
+    nose_direction = nose_tip_x - nose_bridge_x
+    if (
+        pose_label == "profile-right"
+        and face.get("detector") == "response_fallback"
+        and float(face.get("faceLikeScore", 0.0)) <= 0.40
+        and float(visibility.get("eyeVisibility", 0.0)) == 0.0
+        and signed_center_bias >= 0.10
+        and nose_direction >= 16.0
+    ):
+        pose["label"] = "profile-left"
+        pose["confidence"] = max(float(pose.get("confidence", 0.0)), 0.54)
+        pose["reason"] = "profile-direction-low-face-nose-vote"
+        face["faceMode"] = "profile-left"
+        face["profileDirectionVotes"] = ["profile-left", "nose-strong-low-face"]
+        return
+
+    votes = []
+    if signed_center_bias <= -0.035:
+        votes.append("profile-left")
+    elif signed_center_bias >= 0.035:
+        votes.append("profile-right")
+
+    if nose_direction >= 6.0:
+        votes.append("profile-left")
+    elif nose_direction <= -6.0:
+        votes.append("profile-right")
+
+    left_eye = keypoints.get("left_eye_center", {})
+    right_eye = keypoints.get("right_eye_center", {})
+    visible_eye = None
+    if left_eye.get("source") == "detected" and right_eye.get("source") != "detected":
+        visible_eye = left_eye
+    elif right_eye.get("source") == "detected" and left_eye.get("source") != "detected":
+        visible_eye = right_eye
+    if visible_eye:
+        bbox = face.get("bbox", {})
+        width = max(float(bbox.get("w", 1)), 1.0)
+        eye_rx = (float(visible_eye.get("x", 0.0)) - float(bbox.get("x", 0.0))) / width
+        if eye_rx >= 0.56:
+            votes.append("profile-left")
+        elif eye_rx <= 0.44:
+            votes.append("profile-right")
+
+    left_votes = votes.count("profile-left")
+    right_votes = votes.count("profile-right")
+    voted_pose = None
+    if left_votes >= 2 and left_votes > right_votes:
+        voted_pose = "profile-left"
+    elif right_votes >= 2 and right_votes > left_votes:
+        voted_pose = "profile-right"
+
+    if voted_pose and voted_pose != pose_label:
+        pose["label"] = voted_pose
+        pose["confidence"] = max(float(pose.get("confidence", 0.0)), 0.54)
+        pose["reason"] = "profile-direction-vote"
+        face["faceMode"] = voted_pose
+        face["profileDirectionVotes"] = votes
+
+
 def build_face_output(image, preprocessed, candidates, request_uid):
     faces = []
     debug_maps = {"eye": [], "nose": [], "mouth": []}
     for index, candidate in enumerate(candidates):
-        x, y, w, h = candidate["box"]
-        face_gray = preprocessed["equalized"][y : y + h, x : x + w]
-        if face_gray.size == 0:
+        face_region = extract_face_region(image, preprocessed, candidate["box"], candidate["detector"])
+        if face_region is None:
             continue
-        eye_response, eye_candidates, eye_metrics = detect_eye_candidates(face_gray)
+        x, y, w, h = face_region["bbox"]
+        face_gray = face_region["gray"]
+        face_mask = face_region["mask"]
+        mediapipe_landmarks = candidate.get("mediapipeLandmarks")
+        yunet_landmarks = candidate.get("yunetLandmarks")
+
+        eye_response, eye_candidates, eye_metrics = detect_eye_candidates(face_gray, face_mask)
         eye_selection, eye_quality, eye_reason = select_eye_configuration(face_gray, eye_candidates)
-        edge_profile = build_face_edge_profile(face_gray)
+        if mediapipe_landmarks:
+            mp_eye_selection, mp_eye_quality, mp_eye_reason, mp_eye_metrics = build_mediapipe_eye_support(
+                (x, y, w, h),
+                mediapipe_landmarks,
+                image.shape,
+                eye_metrics,
+            )
+            if candidate["detector"] == "mediapipe_landmarker" or mp_eye_quality > eye_quality:
+                eye_selection = mp_eye_selection
+                eye_quality = mp_eye_quality
+                eye_reason = mp_eye_reason
+                eye_metrics = mp_eye_metrics
+        if yunet_landmarks:
+            yunet_eye_support = build_yunet_eye_support((x, y, w, h), yunet_landmarks, eye_metrics)
+            if yunet_eye_support is not None:
+                yn_eye_selection, yn_eye_quality, yn_eye_reason, yn_eye_metrics = yunet_eye_support
+                if candidate["detector"] == "yunet" and yn_eye_quality > eye_quality:
+                    eye_selection = yn_eye_selection
+                    eye_quality = yn_eye_quality
+                    eye_reason = yn_eye_reason
+                    eye_metrics = yn_eye_metrics
+        edge_profile = build_face_edge_profile(face_gray, face_mask)
         pose_label, pose_confidence, pose_reason = classify_pose(
             eye_selection,
             eye_quality,
@@ -1311,17 +2697,23 @@ def build_face_output(image, preprocessed, candidates, request_uid):
             edge_profile,
             eye_metrics,
         )
-        nose_response, nose_bridge_top, nose_tip = detect_nose_keypoints(face_gray, (x, y, w, h), pose_label)
-        mouth_response, _, mouth_left, mouth_center, mouth_right = detect_mouth_keypoints(face_gray, (x, y, w, h), pose_label)
+        nose_response, nose_bridge_top, nose_tip = detect_nose_keypoints(face_gray, (x, y, w, h), pose_label, face_mask)
+        mouth_response, _, mouth_left, mouth_center, mouth_right = detect_mouth_keypoints(face_gray, (x, y, w, h), pose_label, face_mask)
         keypoints = build_keypoints((x, y, w, h), pose_label, eye_selection, nose_bridge_top, nose_tip, mouth_left, mouth_center, mouth_right)
+        if mediapipe_landmarks:
+            keypoints = apply_mediapipe_keypoints(keypoints, (x, y, w, h), pose_label, mediapipe_landmarks, image.shape)
+        if yunet_landmarks:
+            keypoints = apply_yunet_keypoints(keypoints, (x, y, w, h), pose_label, yunet_landmarks)
         deepfake_features = compute_deepfake_features(
+            face_region["bgr"],
             face_gray,
             (x, y, w, h),
             keypoints,
             pose_label,
             eye_selection,
-            edge_profile["edgeDensity"],
+            edge_profile,
             eye_metrics,
+            face_mask,
         )
         refined_pose_label, refined_pose_confidence, refined_pose_reason = refine_pose_label(
             candidate["detector"],
@@ -1337,26 +2729,33 @@ def build_face_output(image, preprocessed, candidates, request_uid):
             pose_confidence = refined_pose_confidence
             pose_reason = refined_pose_reason
             keypoints = build_keypoints((x, y, w, h), pose_label, eye_selection, nose_bridge_top, nose_tip, mouth_left, mouth_center, mouth_right)
+            if mediapipe_landmarks:
+                keypoints = apply_mediapipe_keypoints(keypoints, (x, y, w, h), pose_label, mediapipe_landmarks, image.shape)
+            if yunet_landmarks:
+                keypoints = apply_yunet_keypoints(keypoints, (x, y, w, h), pose_label, yunet_landmarks)
+            deepfake_features = compute_deepfake_features(
+                face_region["bgr"],
+                face_gray,
+                (x, y, w, h),
+                keypoints,
+                pose_label,
+                eye_selection,
+                edge_profile,
+                eye_metrics,
+                face_mask,
+            )
         detected_points = sum(1 for keypoint in keypoints.values() if keypoint["source"] == "detected")
         detected_ratio = detected_points / float(max(len(keypoints), 1))
-        blur_score = compute_blur_score(face_gray)
-        brightness_score = compute_brightness_score(face_gray)
-        contrast_score = compute_contrast_score(face_gray)
+        blur_score = compute_blur_score(face_gray, face_mask)
+        brightness_score = compute_brightness_score(face_gray, face_mask)
+        contrast_score = compute_contrast_score(face_gray, face_mask)
         quality_label, quality_score = classify_quality(blur_score, brightness_score, contrast_score, pose_confidence, detected_ratio, min(w, h))
         connections = build_connections()
         regions = build_regions((x, y, w, h), keypoints, pose_label)
-        deepfake_features = compute_deepfake_features(
-            face_gray,
-            (x, y, w, h),
-            keypoints,
-            pose_label,
-            eye_selection,
-            edge_profile["edgeDensity"],
-            eye_metrics,
-        )
         face = {
             "bbox": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
             "detector": candidate["detector"],
+            "landmarkSource": "mediapipe_face_landmarker" if mediapipe_landmarks else ("yunet_face_detector" if yunet_landmarks else "veritai_response_maps"),
             "score": round(float(candidate["score"]), 4),
             "detectionConfidence": round(float(candidate["score"]), 4),
             "pose": {"label": pose_label, "confidence": round(float(pose_confidence), 4), "reason": pose_reason},
@@ -1364,17 +2763,22 @@ def build_face_output(image, preprocessed, candidates, request_uid):
             "quality": {"label": quality_label, "score": quality_score, "blur": blur_score, "brightness": brightness_score, "contrast": contrast_score, "detectedPointRatio": round(float(detected_ratio), 4)},
             "eyes": build_eye_overlay_boxes((x, y, w, h), keypoints, pose_label),
             "keypoints": keypoints,
+            "faceContour": contour_to_points(face_region["contour"], (x, y, w, h)),
             "analysisConnections": serialize_connections(connections),
             "analysisRegions": serialize_regions(regions),
-            "cropPath": save_face_crop(image, request_uid, index, candidate["box"]),
+            "cropPath": save_face_crop(image, request_uid, index, candidate["box"], face_mask),
             "trainingSample": None,
             "featureSummary": {"eyeEvidence": round(float(eye_quality), 4), "eyeReason": eye_reason, "noseEvidence": nose_tip["confidence"], "mouthEvidence": mouth_center["confidence"]},
             "deepfakeFeatures": deepfake_features,
         }
+        face_like_score = compute_face_like_score(face)
+        face["faceLikeScore"] = face_like_score
+        face["deepfakeFeatures"]["faceLikeScore"] = face_like_score
         keep_face, keep_reason = should_keep_face(face)
         face["candidateDecision"] = {"accepted": keep_face, "reason": keep_reason}
         if not keep_face:
             continue
+        refine_face_label_after_quality(face)
         face["trainingSample"] = build_training_sample(face)
         faces.append(face)
         debug_maps["eye"].append({"bbox": face["bbox"], "response": eye_response})
@@ -1393,6 +2797,10 @@ def draw_face_overlay(image, faces, output_path):
         h = bbox["h"]
         color = (0, 200, 0) if face["quality"]["label"] != "poor" else (0, 165, 255)
         cv2.rectangle(canvas, (x, y), (x + w, y + h), color, 2)
+        contour = face.get("faceContour", [])
+        if contour:
+            pts = np.array([[point["x"], point["y"]] for point in contour], dtype=np.int32)
+            cv2.polylines(canvas, [pts], True, (0, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(canvas, f"{index + 1}: {face['pose']['label']} {face['detectionConfidence']:.2f}", (x, max(y - 8, 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
         for eye in face["eyes"]:
             cv2.rectangle(canvas, (eye["x"], eye["y"]), (eye["x"] + eye["w"], eye["y"] + eye["h"]), (255, 0, 255), 1)
@@ -1439,10 +2847,18 @@ def draw_analysis_map(image, faces, output_path):
     canvas[:, :image_w] = image.copy()
     overlay = canvas[:, :image_w].copy()
     for face in faces:
+        face_overlay = np.zeros_like(overlay)
         for region in face.get("analysisRegions", []):
             pts = np.array([[point["x"], point["y"]] for point in region["points"]], dtype=np.int32)
             if len(pts) >= 3:
-                cv2.fillPoly(overlay, [pts], tuple(region["color"]))
+                cv2.fillPoly(face_overlay, [pts], tuple(region["color"]))
+        contour = face.get("faceContour", [])
+        if contour:
+            contour_mask = np.zeros((image_h, image_w), dtype=np.uint8)
+            contour_points = np.array([[point["x"], point["y"]] for point in contour], dtype=np.int32)
+            cv2.fillPoly(contour_mask, [contour_points], 255)
+            face_overlay = cv2.bitwise_and(face_overlay, face_overlay, mask=contour_mask)
+        overlay = cv2.addWeighted(overlay, 1.0, face_overlay, 1.0, 0.0)
     canvas[:, :image_w] = cv2.addWeighted(overlay, 0.18, canvas[:, :image_w], 0.82, 0)
     for index, face in enumerate(faces):
         bbox = face["bbox"]
@@ -1451,6 +2867,10 @@ def draw_analysis_map(image, faces, output_path):
         w = bbox["w"]
         h = bbox["h"]
         cv2.rectangle(canvas[:, :image_w], (x, y), (x + w, y + h), (0, 255, 255), 2)
+        contour = face.get("faceContour", [])
+        if contour:
+            pts = np.array([[point["x"], point["y"]] for point in contour], dtype=np.int32)
+            cv2.polylines(canvas[:, :image_w], [pts], True, (255, 220, 120), 1, cv2.LINE_AA)
         keypoints = face["keypoints"]
         for connection in face["analysisConnections"]:
             start = keypoints.get(connection["from"])
@@ -1485,7 +2905,7 @@ def draw_analysis_map(image, faces, output_path):
     for index, face in enumerate(faces):
         quality = face["quality"]
         pose = face["pose"]
-        y = draw_panel_text(canvas, ["", f"[Face {index + 1}]", f"detector={face['detector']}", f"pose={pose['label']} ({pose['confidence']:.4f})", f"quality={quality['label']} ({quality['score']:.4f})", f"detectedPointRatio={quality['detectedPointRatio']:.4f}", f"eye={face['featureSummary']['eyeEvidence']:.4f}", f"nose={face['featureSummary']['noseEvidence']:.4f}", f"mouth={face['featureSummary']['mouthEvidence']:.4f}", f"edgeDensity={face['deepfakeFeatures']['texture']['edgeDensity']:.4f}", f"noiseScore={face['deepfakeFeatures']['texture']['noiseScore']:.4f}"], panel_x, y + 8)
+        y = draw_panel_text(canvas, ["", f"[Face {index + 1}]", f"detector={face['detector']}", f"pose={pose['label']} ({pose['confidence']:.4f})", f"quality={quality['label']} ({quality['score']:.4f})", f"detectedPointRatio={quality['detectedPointRatio']:.4f}", f"maskCoverage={face['deepfakeFeatures']['visibility'].get('faceMaskCoverage', 1.0):.4f}", f"eye={face['featureSummary']['eyeEvidence']:.4f}", f"nose={face['featureSummary']['noseEvidence']:.4f}", f"mouth={face['featureSummary']['mouthEvidence']:.4f}", f"edgeDensity={face['deepfakeFeatures']['texture']['edgeDensity']:.4f}", f"noiseScore={face['deepfakeFeatures']['texture']['noiseScore']:.4f}"], panel_x, y + 8)
         point_lines = [f"{point_name}: ({face['keypoints'][point_name]['x']},{face['keypoints'][point_name]['y']}) {face['keypoints'][point_name]['source']} {face['keypoints'][point_name]['confidence']:.2f}" for point_name in TRAINING_POINT_ORDER]
         y = draw_panel_text(canvas, point_lines, panel_x + 10, y, color=(210, 210, 210), line_gap=17)
     cv2.imwrite(output_path, canvas)
@@ -1519,7 +2939,7 @@ async def predict(file: UploadFile = File(...)):
     img = decode_image(contents)
     if img is None:
         return {"isDeepfake": False, "confidence": 0.0, "faceCount": 0, "watermarkDetected": False, "modelVersion": "veritai-pose-aware-anchor-graph-v1", "processingTimeMs": 0, "message": "이미지 디코딩에 실패했습니다.", "faces": [], "debugImages": {}}
-    max_width = 1280
+    max_width = MAX_IMAGE_WIDTH
     if img.shape[1] > max_width:
         ratio = max_width / img.shape[1]
         img = cv2.resize(img, None, fx=ratio, fy=ratio)
@@ -1527,16 +2947,26 @@ async def predict(file: UploadFile = File(...)):
     preprocessed = preprocess_image(img)
     candidates = detect_faces(preprocessed)
     faces, debug_maps = build_face_output(img, preprocessed, candidates, request_uid)
-    draw_face_overlay(img, faces, debug_paths["overlay"])
-    draw_analysis_map(img, faces, debug_paths["analysisMap"])
-    draw_response_map(img, debug_maps["eye"], debug_paths["eyeResponse"], "Eye Response Map")
-    draw_response_map(img, debug_maps["nose"], debug_paths["noseResponse"], "Nose Response Map")
-    draw_response_map(img, debug_maps["mouth"], debug_paths["mouthResponse"], "Mouth Response Map")
-    save_debug_metadata(request_uid, faces, debug_paths)
+    if not faces:
+        for rescue_detector in (detect_with_mediapipe_landmarker, detect_with_yunet):
+            rescue_candidates = rescue_detector(preprocessed)
+            if not rescue_candidates:
+                continue
+            faces, debug_maps = build_face_output(img, preprocessed, rescue_candidates, request_uid)
+            if faces:
+                break
+    if DEBUG_ARTIFACTS:
+        draw_face_overlay(img, faces, debug_paths["overlay"])
+        draw_analysis_map(img, faces, debug_paths["analysisMap"])
+        draw_response_map(img, debug_maps["eye"], debug_paths["eyeResponse"], "Eye Response Map")
+        draw_response_map(img, debug_maps["nose"], debug_paths["noseResponse"], "Nose Response Map")
+        draw_response_map(img, debug_maps["mouth"], debug_paths["mouthResponse"], "Mouth Response Map")
+        save_debug_metadata(request_uid, faces, debug_paths)
     processing_time_ms = int((time.time() - start) * 1000)
     ready_faces = [face for face in faces if face["quality"]["label"] != "poor"]
     confidence = round(sum(face["detectionConfidence"] for face in faces) / len(faces), 4) if faces else 0.0
-    return {"isDeepfake": False, "confidence": confidence, "faceCount": len(faces), "watermarkDetected": False, "modelVersion": "veritai-pose-aware-anchor-graph-v1", "processingTimeMs": processing_time_ms, "message": f"얼굴 {len(faces)}개를 검출했고, 그중 분석에 바로 활용 가능한 품질의 얼굴은 {len(ready_faces)}개입니다.", "faces": faces, "debugImages": {key: normalize_path(path) for key, path in debug_paths.items()}}
+    debug_images = {key: normalize_path(path) for key, path in debug_paths.items()} if DEBUG_ARTIFACTS else {}
+    return {"isDeepfake": False, "confidence": confidence, "faceCount": len(faces), "watermarkDetected": False, "modelVersion": "veritai-pose-aware-anchor-graph-v1", "processingTimeMs": processing_time_ms, "message": f"얼굴 {len(faces)}개를 검출했고, 그중 분석에 바로 활용 가능한 품질의 얼굴은 {len(ready_faces)}개입니다.", "faces": faces, "debugImages": debug_images}
 
 
 @app.get("/")

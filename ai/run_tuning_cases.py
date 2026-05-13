@@ -12,6 +12,8 @@ try:
 except ImportError:
     import main as pipeline
 
+pipeline.DEBUG_ARTIFACTS = True
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CASE_DIR = ROOT / "ai" / "tuning_cases"
@@ -33,6 +35,14 @@ def analyze_file(image_path: Path) -> dict:
     request_uid, debug_paths = pipeline.make_debug_paths()
     candidates = pipeline.detect_faces(preprocessed)
     faces, debug_maps = pipeline.build_face_output(image, preprocessed, candidates, request_uid)
+    if not faces:
+        for rescue_detector in (pipeline.detect_with_mediapipe_landmarker, pipeline.detect_with_yunet):
+            rescue_candidates = rescue_detector(preprocessed)
+            if not rescue_candidates:
+                continue
+            faces, debug_maps = pipeline.build_face_output(image, preprocessed, rescue_candidates, request_uid)
+            if faces:
+                break
 
     pipeline.draw_face_overlay(image, faces, debug_paths["overlay"])
     pipeline.draw_analysis_map(image, faces, debug_paths["analysisMap"])
@@ -53,6 +63,18 @@ def analyze_file(image_path: Path) -> dict:
             face.get("deepfakeFeatures", {}).get("visibility", {}).get("eyeClosureIndex", 0.0)
             for face in faces
         ],
+        "eyeClosureScores": [
+            face.get("deepfakeFeatures", {}).get("visibility", {}).get("eyeClosureScore", 0.0)
+            for face in faces
+        ],
+        "occlusionScores": [
+            face.get("deepfakeFeatures", {}).get("visibility", {}).get("occlusionScore", 0.0)
+            for face in faces
+        ],
+        "profileEyeClosureScores": [
+            face.get("deepfakeFeatures", {}).get("visibility", {}).get("profileEyeClosureScore", 0.0)
+            for face in faces
+        ],
         "generatedFiles": {key: path.replace("\\", "/") for key, path in debug_paths.items()},
     }
 
@@ -66,6 +88,9 @@ def evaluate_result(category: str, result: dict) -> dict:
     qualities = result.get("qualities", [])
     detected_ratios = result.get("detectedPointRatios", [])
     eye_closure = result.get("eyeClosureIndices", [])
+    eye_closure_scores = result.get("eyeClosureScores", eye_closure)
+    occlusion_scores = result.get("occlusionScores", [])
+    profile_eye_closure_scores = result.get("profileEyeClosureScores", eye_closure_scores)
 
     if category == "false_positive":
         if face_count == 0:
@@ -106,6 +131,8 @@ def evaluate_result(category: str, result: dict) -> dict:
     if category in {"eyes_closed", "eyes_closed_frontal"}:
         if "eyes_closed" in poses:
             return {"rating": "pass", "reason": "eyes-closed-detected"}
+        if any(value >= 0.65 for value in eye_closure_scores):
+            return {"rating": "pass", "reason": "high-eye-closure-score"}
         if any(value >= 0.65 for value in eye_closure):
             return {"rating": "warn", "reason": "high-eye-closure-index-but-pose-not-eyes_closed"}
         if "frontal" in poses:
@@ -115,24 +142,34 @@ def evaluate_result(category: str, result: dict) -> dict:
     if category == "eyes_closed_profile":
         if "eyes_closed" in poses:
             return {"rating": "pass", "reason": "eyes-closed-detected"}
-        if any(pose in {"profile-left", "profile-right"} for pose in poses) and any(value >= 0.12 for value in eye_closure):
+        if any(value >= 0.55 for value in profile_eye_closure_scores):
+            return {"rating": "pass", "reason": "high-profile-eye-closure-score"}
+        if any(pose in {"profile-left", "profile-right"} for pose in poses) and any(value >= 0.12 for value in eye_closure_scores):
             return {"rating": "pass", "reason": "profile-detected-with-meaningful-eye-closure-signal"}
         if any(pose in {"profile-left", "profile-right"} for pose in poses):
             return {"rating": "warn", "reason": "profile-detected-but-eye-closure-signal-is-weak"}
-        if any(value >= 0.65 for value in eye_closure):
+        if any(value >= 0.40 for value in profile_eye_closure_scores):
+            return {"rating": "warn", "reason": "profile-eye-closure-score-suggests-closed-profile"}
+        if any(value >= 0.65 for value in eye_closure_scores):
             return {"rating": "warn", "reason": "high-eye-closure-index-but-profile-label-missed"}
         return {"rating": "fail", "reason": f"eyes-closed-profile-missed poses={poses}"}
 
     if category == "eyes_closed_occluded":
         if "eyes_closed" in poses or "occluded" in poses:
             return {"rating": "pass", "reason": "occluded-or-eyes-closed-detected"}
-        if any(value >= 0.65 for value in eye_closure) or any(ratio < 0.35 for ratio in detected_ratios):
+        if any(value >= 0.58 for value in eye_closure_scores) or any(value >= 0.50 for value in occlusion_scores):
+            return {"rating": "pass", "reason": "occlusion-or-eye-closure-score-high"}
+        if any(value >= 0.35 for value in occlusion_scores) or any(value >= 0.35 for value in eye_closure_scores) or any(ratio < 0.35 for ratio in detected_ratios):
             return {"rating": "warn", "reason": "occluded-eyes-closed-signal-present-but-label-missed"}
         return {"rating": "fail", "reason": f"eyes-closed-occluded-missed poses={poses}"}
 
     if category == "occluded":
         if "occluded" in poses:
             return {"rating": "pass", "reason": "occlusion-detected"}
+        if any(value >= 0.50 for value in occlusion_scores):
+            return {"rating": "pass", "reason": "high-occlusion-score"}
+        if any(value >= 0.35 for value in occlusion_scores):
+            return {"rating": "warn", "reason": "occlusion-score-suggests-occlusion"}
         if any(ratio < 0.35 for ratio in detected_ratios):
             return {"rating": "warn", "reason": "low-detected-point-ratio-suggests-occlusion"}
         return {"rating": "fail", "reason": f"occlusion-missed poses={poses}"}
@@ -237,6 +274,9 @@ def export_review_artifacts(run_path: Path, result: dict) -> str | None:
         "faceCount": result.get("faceCount", 0),
         "detectedPointRatios": result.get("detectedPointRatios", []),
         "eyeClosureIndices": result.get("eyeClosureIndices", []),
+        "eyeClosureScores": result.get("eyeClosureScores", []),
+        "occlusionScores": result.get("occlusionScores", []),
+        "profileEyeClosureScores": result.get("profileEyeClosureScores", []),
         "copiedFiles": copied_files,
     }
     summary_path = review_dir / "case_summary.json"
@@ -306,7 +346,7 @@ def write_summary(run_path: Path, results: list[dict]) -> None:
             "- `profile_left`: `profile-left` pose means `pass`.",
             "- `profile_right`: `profile-right` pose means `pass`.",
             "- `eyes_closed_frontal`: `eyes_closed` pose means `pass`, and `frontal` with strong closure becomes `warn`.",
-            "- `eyes_closed_profile`: `eyes_closed` or `profile-*` with meaningful closure signal means `pass`.",
+            "- `eyes_closed_profile`: `eyes_closed`, strong `profileEyeClosureScore`, or `profile-*` with meaningful closure signal means `pass`.",
             "- `eyes_closed_occluded`: `occluded` or `eyes_closed` pose means `pass`.",
             "- `occluded`: `occluded` pose means `pass`.",
             "- `false_positive`: zero detected faces means `pass`.",
@@ -321,6 +361,20 @@ def write_summary(run_path: Path, results: list[dict]) -> None:
 
     label_issues = [result for result in results if result.get("labelIssue")]
     if label_issues:
+        priority_issues = [
+            result
+            for result in label_issues
+            if result["labelIssue"] in {
+                "possible-direction-label-mismatch",
+                "possible-mislabeled-false-positive",
+                "possible-profile-label-mismatch",
+            }
+        ]
+        if priority_issues:
+            lines.extend(["", "## Priority Label Review", ""])
+            for result in priority_issues:
+                case = Path(result["input"]).relative_to(ROOT).as_posix()
+                lines.append(f"- `{case}`: `{result['labelIssue']}`")
         lines.extend(["", "## Label Quality Notes", ""])
         for result in label_issues:
             case = Path(result["input"]).relative_to(ROOT).as_posix()

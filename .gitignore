@@ -28,10 +28,12 @@ backend/backend_spring/uploads/
 ### AI ###
 ai/venv/
 ai/debug/
+ai/tmp/
 
 ### Generated analysis artifacts ###
 images/analysis/
 images/faces/
+images/tuning_runs/
 uploads/
 
 ### Frontend / Extension ###

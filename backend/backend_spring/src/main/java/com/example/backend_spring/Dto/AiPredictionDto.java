@@ -10,6 +10,9 @@ public class AiPredictionDto {
     private int faceCount;
     private boolean watermarkDetected;
     private String modelVersion;
+    private String analysisMode;
+    private Map<String, Object> analysisInput;
+    private Map<String, Object> timings;
     private long processingTimeMs;
     private String message;
     private List<Map<String, Object>> faces;
@@ -53,6 +56,30 @@ public class AiPredictionDto {
 
     public void setModelVersion(String modelVersion) {
         this.modelVersion = modelVersion;
+    }
+
+    public String getAnalysisMode() {
+        return analysisMode;
+    }
+
+    public void setAnalysisMode(String analysisMode) {
+        this.analysisMode = analysisMode;
+    }
+
+    public Map<String, Object> getAnalysisInput() {
+        return analysisInput;
+    }
+
+    public void setAnalysisInput(Map<String, Object> analysisInput) {
+        this.analysisInput = analysisInput;
+    }
+
+    public Map<String, Object> getTimings() {
+        return timings;
+    }
+
+    public void setTimings(Map<String, Object> timings) {
+        this.timings = timings;
     }
 
     public long getProcessingTimeMs() {

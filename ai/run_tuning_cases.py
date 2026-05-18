@@ -36,7 +36,7 @@ def analyze_file(image_path: Path) -> dict:
     candidates = pipeline.detect_faces(preprocessed)
     faces, debug_maps = pipeline.build_face_output(image, preprocessed, candidates, request_uid)
     if not faces:
-        for rescue_detector in (pipeline.detect_with_mediapipe_landmarker, pipeline.detect_with_yunet):
+        for rescue_detector in (pipeline.detect_with_landmark_consensus, pipeline.detect_with_mediapipe_landmarker, pipeline.detect_with_yunet):
             rescue_candidates = rescue_detector(preprocessed)
             if not rescue_candidates:
                 continue

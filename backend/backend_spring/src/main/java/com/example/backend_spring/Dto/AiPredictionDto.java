@@ -1,10 +1,14 @@
 package com.example.backend_spring.Dto;
 
+import com.fasterxml.jackson.annotation.JsonAlias;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import java.util.List;
 import java.util.Map;
 
 public class AiPredictionDto {
 
+    @JsonProperty("isDeepfake")
+    @JsonAlias("deepfake")
     private boolean isDeepfake;
     private double confidence;
     private int faceCount;
@@ -18,10 +22,12 @@ public class AiPredictionDto {
     private List<Map<String, Object>> faces;
     private Map<String, String> debugImages;
 
+    @JsonProperty("isDeepfake")
     public boolean isDeepfake() {
         return isDeepfake;
     }
 
+    @JsonProperty("isDeepfake")
     public void setDeepfake(boolean deepfake) {
         isDeepfake = deepfake;
     }

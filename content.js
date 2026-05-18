@@ -30,6 +30,11 @@ function shouldInspectMedia(media) {
     return isVisibleMedia(media);
 }
 
+function readDeepfakeFlag(result) {
+    if (!result) return false;
+    return Boolean(result.isDeepfake ?? result.deepfake);
+}
+
 function updateStatusBadge(media, status, data = null) {
     const wrapper = ensureWrapper(media);
     if (!wrapper) return;
@@ -151,7 +156,7 @@ function updateStatusBadge(media, status, data = null) {
                     <span style="cursor:pointer; color:gray;" onclick="this.closest('.veritai-details-box').remove()">✕</span>
 </div>
 <b>ID:</b> ${data.requestId}
-<b>판정:</b> ${result.isDeepfake ? "<span style='color:crimson; font-weight:bold;'>조작 의심</span>" : "<span style='color:green; font-weight:bold;'>정상</span>"} (${((result.confidence || 0) * 100).toFixed(1)}%)
+<b>판정:</b> ${readDeepfakeFlag(result) ? "<span style='color:crimson; font-weight:bold;'>조작 의심</span>" : "<span style='color:green; font-weight:bold;'>정상</span>"} (${((result.confidence || 0) * 100).toFixed(1)}%)
 <b>시간:</b> ${result.processingTimeMs}ms
 <b>얼굴 수:</b> ${result.faceCount || faces.length}명
 <div style="margin:10px 0; border-top:1px dashed grey;"></div>
@@ -203,7 +208,7 @@ async function startInspection(media) {
 
         const data = await sendToBackend(blob, mediaType, FACE_CROP_ANALYSIS_MODE);
         
-        if (data.result.isDeepfake) {
+        if (readDeepfakeFlag(data.result)) {
             updateStatusBadge(media, "fake", data);
         } else {
             updateStatusBadge(media, "real", data);

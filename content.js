@@ -3,6 +3,32 @@ const API_URL = "http://localhost:8080/api/detections";
 
 let isSystemOn = true;
 let isAutoScanMode = false;
+const FACE_CROP_ANALYSIS_MODE = "face_crop_only";
+const scannedMediaKeys = new Set();
+
+function getMediaSource(media) {
+    if (!media) return "";
+    return media.currentSrc || media.src || media.poster || "";
+}
+
+function getMediaKey(media) {
+    const source = getMediaSource(media);
+    if (source) return `${media.tagName}:${source}`;
+    const rect = media.getBoundingClientRect();
+    return `${media.tagName}:${Math.round(rect.left)}:${Math.round(rect.top)}:${Math.round(rect.width)}:${Math.round(rect.height)}`;
+}
+
+function isVisibleMedia(media) {
+    if (!media || !media.isConnected) return false;
+    const rect = media.getBoundingClientRect();
+    if (rect.width < 80 || rect.height < 80) return false;
+    const style = getComputedStyle(media);
+    return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+}
+
+function shouldInspectMedia(media) {
+    return isVisibleMedia(media);
+}
 
 function updateStatusBadge(media, status, data = null) {
     const wrapper = ensureWrapper(media);
@@ -149,8 +175,13 @@ ${faceText}
 }
 
 async function startInspection(media) {
-    if (media.dataset.veritaiScanned === "true" || !isSystemOn) return;
+    if (!isSystemOn || !shouldInspectMedia(media)) return;
+
+    const scanKey = getMediaKey(media);
+    if (media.dataset.veritaiScanned === "true" || scannedMediaKeys.has(scanKey)) return;
+    scannedMediaKeys.add(scanKey);
     media.dataset.veritaiScanned = "true";
+    media.dataset.veritaiScanKey = scanKey;
 
     const wrapper = ensureWrapper(media);
     if (wrapper) {
@@ -170,7 +201,7 @@ async function startInspection(media) {
             blob = await captureImageBlob(media.currentSrc || media.src);
         }
 
-        const data = await sendToBackend(blob, mediaType);
+        const data = await sendToBackend(blob, mediaType, FACE_CROP_ANALYSIS_MODE);
         
         if (data.result.isDeepfake) {
             updateStatusBadge(media, "fake", data);
@@ -180,25 +211,26 @@ async function startInspection(media) {
 
     } catch (err) {
         console.error("Analysis Error:", err);
-        let friendlyMessage = "분석 오류";
+        let friendlyMessage = "Analysis error";
         if (err.name === 'TypeError' && err.message === 'Failed to fetch') {
-            friendlyMessage = "서버 연결 실패";
-        } 
-        else if (err.message && err.message.includes("서버 응답 오류")) {
-            friendlyMessage = "서버 응답 오류";
+            friendlyMessage = "Server connection failed";
+        }
+        else if (err.message && err.message.includes("Server response error")) {
+            friendlyMessage = "Server response error";
         }
         else if (err.message && err.message.includes("CORS")) {
-            friendlyMessage = "보안 차단됨";
+            friendlyMessage = "Blocked by browser security";
         }
         updateStatusBadge(media, "error", { message: friendlyMessage });
         delete media.dataset.veritaiScanned;
+        scannedMediaKeys.delete(scanKey);
     }
 }
 
 const autoScanObserver = new IntersectionObserver((entries) => {
     if (!isSystemOn || !isAutoScanMode) return;
     entries.forEach(entry => {
-        if (entry.isIntersecting && entry.target.clientWidth > 80) {
+        if (entry.isIntersecting && shouldInspectMedia(entry.target)) {
             startInspection(entry.target);
         }
     });
@@ -207,6 +239,17 @@ const autoScanObserver = new IntersectionObserver((entries) => {
 const domObserver = new MutationObserver((mutations) => {
     if (!isSystemOn) return;
     mutations.forEach(mutation => {
+        if (mutation.type === "attributes") {
+            const node = mutation.target;
+            if (node.nodeType !== 1) return;
+            if (node.tagName === 'IMG' || node.tagName === 'VIDEO') {
+                attachUI(node);
+            } else {
+                node.querySelectorAll?.('img, video').forEach(media => attachUI(media));
+            }
+            return;
+        }
+
         mutation.addedNodes.forEach(node => {
             if (node.nodeType !== 1) return; 
             if (node.tagName === 'IMG' || node.tagName === 'VIDEO') {
@@ -234,6 +277,10 @@ function ensureWrapper(media) {
 
 function attachUI(media) {
     if (media.dataset.veritaiAttached || media.clientWidth < 80 || media.clientHeight < 80) return;
+    if (!shouldInspectMedia(media)) {
+        delete media.dataset.veritaiAttached;
+        return;
+    }
     media.dataset.veritaiAttached = "true";
 
     if (isAutoScanMode) {
@@ -268,7 +315,7 @@ chrome.runtime.onMessage.addListener((msg) => {
         clearAllUI();
         if (isSystemOn) {
             document.querySelectorAll('img, video').forEach(media => attachUI(media));
-            domObserver.observe(document.body, { childList: true, subtree: true });
+            domObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "style", "open", "aria-hidden", "aria-modal"] });
         } else {
             autoScanObserver.disconnect();
             domObserver.disconnect();
@@ -277,10 +324,12 @@ chrome.runtime.onMessage.addListener((msg) => {
 });
 
 function clearAllUI() {
+    scannedMediaKeys.clear();
     document.querySelectorAll('img, video').forEach(media => {
         media.style.border = "none";
         delete media.dataset.veritaiScanned;
         delete media.dataset.veritaiAttached;
+        delete media.dataset.veritaiScanKey;
         const wrapper = media.parentElement;
         if (wrapper) {
             const container = wrapper.querySelector('.veritai-ui-container');
@@ -298,7 +347,7 @@ chrome.storage.local.get(['isSystemOn', 'isAutoScanOn'], (result) => {
     setTimeout(() => {
         if (isSystemOn) {
             document.querySelectorAll('img, video').forEach(media => attachUI(media));
-            domObserver.observe(document.body, { childList: true, subtree: true });
+            domObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "style", "open", "aria-hidden", "aria-modal"] });
         }
     }, 500);
 });
@@ -357,19 +406,20 @@ async function captureImageBlob(url) {
     });
 }
 
-async function sendToBackend(blob, mediaType) {
+async function sendToBackend(blob, mediaType, analysisMode = FACE_CROP_ANALYSIS_MODE) {
     const formData = new FormData();
     formData.append("file", blob, "capture.jpg");
     formData.append("sourceUrl", window.location.href);
     formData.append("mediaType", mediaType);
     formData.append("clientType", "chrome-extension");
+    formData.append("analysisMode", analysisMode);
 
     const response = await fetch(API_URL, {
         method: "POST",
         body: formData,
     });
 
-    if (!response.ok) throw new Error(`서버 응답 오류: ${response.status}`);
+    if (!response.ok) throw new Error(`Server response error: ${response.status}`);
     const data = await response.json();
     if (!data || data.status !== "DONE" || !data.result) {
         throw new Error(data?.message || "분석이 정상적으로 완료되지 않았습니다.");

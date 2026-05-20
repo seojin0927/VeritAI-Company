@@ -147,6 +147,40 @@ def normalize_path(path):
     return path.replace("\\", "/")
 
 
+def run_cnn_prediction(image, faces):
+    try:
+        from cnn import predict_image_faces
+    except Exception as exc:
+        return {
+            "modelLoaded": False,
+            "error": f"cnn import failed: {exc}",
+            "fakeProbability": 0.0,
+            "isDeepfake": False,
+            "views": [],
+        }
+
+    try:
+        result = predict_image_faces(image, faces)
+    except Exception as exc:
+        return {
+            "modelLoaded": False,
+            "error": f"cnn prediction failed: {exc}",
+            "fakeProbability": 0.0,
+            "isDeepfake": False,
+            "views": [],
+        }
+
+    view_by_name = {view.get("name"): view for view in result.get("views", [])}
+    for index, face in enumerate(faces):
+        view = view_by_name.get(f"face_{index + 1}")
+        if view is not None:
+            face["cnn"] = {
+                "fakeProbability": view.get("fakeProbability", 0.0),
+                "threshold": result.get("threshold"),
+            }
+    return result
+
+
 def decode_image(contents: bytes):
     np_arr = np.frombuffer(contents, np.uint8)
     return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -4663,6 +4697,90 @@ def save_debug_metadata(request_uid, faces, debug_paths):
         json.dump(payload, fp, ensure_ascii=False, indent=2)
 
 
+def _resize_for_service(image_bgr):
+    img = image_bgr
+    max_width = MAX_IMAGE_WIDTH
+    if img.shape[1] > max_width:
+        ratio = max_width / float(img.shape[1])
+        img = cv2.resize(img, None, fx=ratio, fy=ratio)
+    return img
+
+
+def _detect_service_face_candidates(img, preprocessed):
+    candidates = detect_faces(preprocessed)
+    if candidates:
+        return candidates
+    for rescue_detector in (
+        detect_with_landmark_consensus,
+        detect_with_mediapipe_landmarker,
+        detect_with_yunet,
+    ):
+        rescue_candidates = rescue_detector(preprocessed)
+        if rescue_candidates:
+            return rescue_candidates
+    return []
+
+
+def prepare_service_cnn_inputs(image_bgr, analysis_mode="face_crop_only", crop_zip_mode=False):
+    """
+    POST /predict 및 crop_all --pipeline service 에서 사용.
+
+    crop_zip_mode=True (crop_all --service-depth bbox, 기본):
+      detect_faces + extract_face_region 까지만 → CNN bbox 와 동일, 훨씬 빠름.
+    crop_zip_mode=False (/predict):
+      build_face_output 전체 (앵커·포즈·품질 분석 포함).
+    """
+    if image_bgr is None or image_bgr.size == 0:
+        return None, [], {}
+
+    img = _resize_for_service(image_bgr)
+    preprocessed = preprocess_image(img)
+    candidates = _detect_service_face_candidates(img, preprocessed)
+
+    if crop_zip_mode:
+        faces = []
+        for candidate in candidates:
+            face_region = extract_face_region(
+                img, preprocessed, candidate["box"], candidate["detector"]
+            )
+            if face_region is None:
+                continue
+            bbox = face_region["bbox"]
+            if isinstance(bbox, dict):
+                x, y, w, h = bbox["x"], bbox["y"], bbox["w"], bbox["h"]
+            else:
+                x, y, w, h = bbox
+            faces.append(
+                {
+                    "bbox": {
+                        "x": int(x),
+                        "y": int(y),
+                        "w": int(w),
+                        "h": int(h),
+                    }
+                }
+            )
+        return img, faces, {}
+
+    request_uid = uuid.uuid4().hex[:12]
+    faces, debug_maps = build_face_output(img, preprocessed, candidates, request_uid, analysis_mode)
+    if not faces and candidates:
+        for rescue_detector in (
+            detect_with_landmark_consensus,
+            detect_with_mediapipe_landmarker,
+            detect_with_yunet,
+        ):
+            rescue_candidates = rescue_detector(preprocessed)
+            if not rescue_candidates:
+                continue
+            faces, debug_maps = build_face_output(
+                img, preprocessed, rescue_candidates, request_uid, analysis_mode
+            )
+            if faces:
+                break
+    return img, faces, debug_maps
+
+
 @app.post("/predict")
 async def predict(file: UploadFile = File(...), analysisMode: str = Form("full_image")):
     start = time.time()
@@ -4672,28 +4790,11 @@ async def predict(file: UploadFile = File(...), analysisMode: str = Form("full_i
     img = decode_image(contents)
     if img is None:
         return {"isDeepfake": False, "confidence": 0.0, "faceCount": 0, "watermarkDetected": False, "modelVersion": "veritai-pose-aware-anchor-graph-v1", "analysisMode": normalized_mode, "analysisInput": {"detectionImage": "full_image", "featureImage": "cropped_face", "deepfakeImage": "cropped_face"} if normalized_mode == "face_crop_only" else {"detectionImage": "full_image", "featureImage": "full_image", "deepfakeImage": "full_image"}, "processingTimeMs": 0, "message": f"{mode_label}: image decoding failed.", "faces": [], "debugImages": {}}
-    max_width = MAX_IMAGE_WIDTH
-    if img.shape[1] > max_width:
-        ratio = max_width / img.shape[1]
-        img = cv2.resize(img, None, fx=ratio, fy=ratio)
-    request_uid, debug_paths = make_debug_paths()
     detection_started = time.time()
-    preprocessed = preprocess_image(img)
-    candidates = detect_faces(preprocessed)
+    img, faces, debug_maps = prepare_service_cnn_inputs(img, normalized_mode)
     detection_time_ms = int((time.time() - detection_started) * 1000)
-    face_analysis_started = time.time()
-    faces, debug_maps = build_face_output(img, preprocessed, candidates, request_uid, normalized_mode)
-    if not faces:
-        for rescue_detector in (detect_with_landmark_consensus, detect_with_mediapipe_landmarker, detect_with_yunet):
-            rescue_started = time.time()
-            rescue_candidates = rescue_detector(preprocessed)
-            detection_time_ms += int((time.time() - rescue_started) * 1000)
-            if not rescue_candidates:
-                continue
-            faces, debug_maps = build_face_output(img, preprocessed, rescue_candidates, request_uid, normalized_mode)
-            if faces:
-                break
-    face_analysis_time_ms = int((time.time() - face_analysis_started) * 1000)
+    face_analysis_time_ms = 0
+    request_uid, debug_paths = make_debug_paths()
     if DEBUG_ARTIFACTS:
         draw_face_overlay(img, faces, debug_paths["overlay"])
         draw_analysis_map(img, faces, debug_paths["analysisMap"])
@@ -4701,11 +4802,45 @@ async def predict(file: UploadFile = File(...), analysisMode: str = Form("full_i
         draw_response_map(img, debug_maps["nose"], debug_paths["noseResponse"], "Nose Response Map")
         draw_response_map(img, debug_maps["mouth"], debug_paths["mouthResponse"], "Mouth Response Map")
         save_debug_metadata(request_uid, faces, debug_paths)
+    cnn_started = time.time()
+    cnn_result = run_cnn_prediction(img, faces)
+    cnn_time_ms = int((time.time() - cnn_started) * 1000)
     processing_time_ms = int((time.time() - start) * 1000)
     ready_faces = [face for face in faces if face["quality"]["label"] != "poor"]
-    confidence = round(sum(face["detectionConfidence"] for face in faces) / len(faces), 4) if faces else 0.0
+    anchor_confidence = round(sum(face["detectionConfidence"] for face in faces) / len(faces), 4) if faces else 0.0
+    cnn_loaded = bool(cnn_result.get("modelLoaded"))
+    if cnn_loaded:
+        confidence = float(cnn_result.get("fakeProbability", 0.0))
+        is_deepfake = bool(cnn_result.get("isDeepfake", False))
+        model_version = "veritai-anchor-cnn-v1"
+    else:
+        # Do not treat face-detection score as deepfake confidence when CNN is unavailable.
+        confidence = 0.0
+        is_deepfake = False
+        model_version = "veritai-pose-aware-anchor-graph-v1"
+    cnn_error = cnn_result.get("error")
+    message = (
+        f"{mode_label}: detected {len(faces)} face(s); usable faces={len(ready_faces)}; "
+        f"cnnLoaded={cnn_loaded}; detectionAnchorConfidence={anchor_confidence}."
+    )
+    if not cnn_loaded and cnn_error:
+        message += f" cnnError={cnn_error}"
     debug_images = {key: normalize_path(path) for key, path in debug_paths.items()} if DEBUG_ARTIFACTS else {}
-    return {"isDeepfake": False, "confidence": confidence, "faceCount": len(faces), "watermarkDetected": False, "modelVersion": "veritai-pose-aware-anchor-graph-v1", "analysisMode": normalized_mode, "analysisInput": {"detectionImage": "full_image", "featureImage": "cropped_face", "deepfakeImage": "cropped_face"} if normalized_mode == "face_crop_only" else {"detectionImage": "full_image", "featureImage": "full_image", "deepfakeImage": "full_image"}, "timings": {"detectionTimeMs": detection_time_ms, "faceAnalysisTimeMs": face_analysis_time_ms, "totalTimeMs": processing_time_ms}, "processingTimeMs": processing_time_ms, "message": f"{mode_label}: detected {len(faces)} face(s); usable faces={len(ready_faces)}.", "faces": faces, "debugImages": debug_images}
+    return {
+        "isDeepfake": is_deepfake,
+        "confidence": confidence,
+        "faceCount": len(faces),
+        "watermarkDetected": False,
+        "modelVersion": model_version,
+        "analysisMode": normalized_mode,
+        "analysisInput": {"detectionImage": "full_image", "featureImage": "cropped_face", "deepfakeImage": "cropped_face"} if normalized_mode == "face_crop_only" else {"detectionImage": "full_image", "featureImage": "full_image", "deepfakeImage": "full_image"},
+        "timings": {"detectionTimeMs": detection_time_ms, "faceAnalysisTimeMs": face_analysis_time_ms, "cnnTimeMs": cnn_time_ms, "totalTimeMs": processing_time_ms},
+        "processingTimeMs": processing_time_ms,
+        "message": message,
+        "faces": faces,
+        "cnn": cnn_result,
+        "debugImages": debug_images,
+    }
 
 
 @app.get("/")

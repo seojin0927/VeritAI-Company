@@ -39,3 +39,9 @@ function syncState() {
 
 systemToggle.addEventListener('change', syncState);
 autoToggle.addEventListener('change', syncState);
+
+document.getElementById('feedback-link').addEventListener('click', () => {
+    const feedbackUrl = "https://forms.gle/실제_주소"; 
+    
+    chrome.tabs.create({ url: feedbackUrl });
+});

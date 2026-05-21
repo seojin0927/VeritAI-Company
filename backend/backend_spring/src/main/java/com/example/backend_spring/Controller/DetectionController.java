@@ -7,17 +7,14 @@ import com.example.backend_spring.Entity.DetectionRequestEntity;
 import com.example.backend_spring.Entity.DetectionResultEntity;
 import com.example.backend_spring.Repository.DetectionRequestRepository;
 import com.example.backend_spring.Repository.DetectionResultRepository;
+import com.example.backend_spring.Service.DetectionProcessingService;
+import com.example.backend_spring.Service.DetectionProcessingService.QueueFullException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.core.io.FileSystemResource;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.util.LinkedMultiValueMap;
-import org.springframework.util.MultiValueMap;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -25,7 +22,6 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.client.RestTemplate;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.nio.file.Files;
@@ -34,34 +30,32 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.List;
 
 @RestController
 @RequestMapping("/api")
-
 public class DetectionController {
 
-    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(DetectionController.class);
-    private final RestTemplate restTemplate;
+    private static final Logger log = LoggerFactory.getLogger(DetectionController.class);
+    private static final String RETRY_AFTER_SECONDS = "5";
+
     private final DetectionRequestRepository detectionRequestRepository;
     private final DetectionResultRepository detectionResultRepository;
+    private final DetectionProcessingService detectionProcessingService;
     private final ObjectMapper objectMapper;
 
     @Value("${app.upload-dir}")
     private String uploadDir;
 
-    @Value("${app.ai-server-url}")
-    private String aiServerUrl;
-
-    public DetectionController(RestTemplate restTemplate,
-            DetectionRequestRepository detectionRequestRepository,
-            DetectionResultRepository detectionResultRepository,
-            ObjectMapper objectMapper) {
-        this.restTemplate = restTemplate;
+    public DetectionController(DetectionRequestRepository detectionRequestRepository,
+                               DetectionResultRepository detectionResultRepository,
+                               DetectionProcessingService detectionProcessingService,
+                               ObjectMapper objectMapper) {
         this.detectionRequestRepository = detectionRequestRepository;
         this.detectionResultRepository = detectionResultRepository;
+        this.detectionProcessingService = detectionProcessingService;
         this.objectMapper = objectMapper;
     }
 
@@ -71,12 +65,13 @@ public class DetectionController {
             @RequestParam(value = "sourceUrl", required = false) String sourceUrl,
             @RequestParam(value = "mediaType", defaultValue = "image") String mediaType,
             @RequestParam(value = "clientType", defaultValue = "chrome-extension") String clientType,
-            @RequestParam(value = "analysisMode", defaultValue = "full_image") String analysisMode) {
+            @RequestParam(value = "analysisMode", defaultValue = "full_image") String analysisMode
+    ) {
         DetectionRequestEntity requestEntity = new DetectionRequestEntity();
 
         try {
             if (file.isEmpty()) {
-                return ResponseEntity.badRequest().body("업로드 파일이 비어 있습니다.");
+                return ResponseEntity.badRequest().body("Uploaded file is empty.");
             }
 
             byte[] bytes = file.getBytes();
@@ -90,6 +85,7 @@ public class DetectionController {
             Path savedPath = uploadPath.resolve(savedFileName);
             Files.write(savedPath, bytes, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
 
+            String normalizedAnalysisMode = detectionProcessingService.normalizeAnalysisMode(analysisMode);
             requestEntity.setSourceUrl(truncate(sourceUrl, 2000));
             requestEntity.setMediaType(mediaType);
             requestEntity.setClientType(clientType);
@@ -98,45 +94,50 @@ public class DetectionController {
             requestEntity.setFileHash(fileHash);
             requestEntity.setMimeType(file.getContentType());
             requestEntity.setFileSize(file.getSize());
-            requestEntity.setStatus("PROCESSING");
+            requestEntity.setAnalysisMode(normalizedAnalysisMode);
+            requestEntity.setStatus(DetectionProcessingService.STATUS_QUEUED);
             detectionRequestRepository.save(requestEntity);
 
-            AiPredictionDto aiResult = callAiServer(savedPath, analysisMode);
-
-            DetectionResultEntity resultEntity = new DetectionResultEntity();
-            resultEntity.setRequestId(requestEntity.getId());
-            resultEntity.setDeepfake(aiResult.isDeepfake());
-            resultEntity.setConfidence(aiResult.getConfidence());
-            resultEntity.setFaceCount(aiResult.getFaceCount());
-            resultEntity.setWatermarkDetected(aiResult.isWatermarkDetected());
-            resultEntity.setModelVersion(aiResult.getModelVersion());
-            resultEntity.setProcessingTimeMs(aiResult.getProcessingTimeMs());
-            resultEntity.setMessage(aiResult.getMessage());
-            resultEntity.setRawResultJson(objectMapper.writeValueAsString(aiResult));
-            detectionResultRepository.save(resultEntity);
-
-            requestEntity.setStatus("DONE");
-            detectionRequestRepository.save(requestEntity);
+            detectionProcessingService.enqueue(requestEntity.getId(), savedPath, normalizedAnalysisMode);
 
             DetectionResponseDto responseDto = new DetectionResponseDto(
                     requestEntity.getId(),
-                    "DONE",
-                    "분석 완료",
-                    aiResult);
+                    requestEntity.getStatus(),
+                    "Analysis request queued.",
+                    null
+            );
 
-            return ResponseEntity.ok(responseDto);
+            return ResponseEntity.accepted().body(responseDto);
 
-        } catch (Exception e) {
-            requestEntity.setStatus("FAILED");
+        } catch (QueueFullException e) {
+            requestEntity.setStatus(DetectionProcessingService.STATUS_FAILED);
             if (requestEntity.getId() != null) {
                 detectionRequestRepository.save(requestEntity);
             }
 
             DetectionResponseDto errorDto = new DetectionResponseDto(
                     requestEntity.getId(),
-                    "FAILED",
-                    "분석 실패: " + e.getMessage(),
-                    null);
+                    DetectionProcessingService.STATUS_FAILED,
+                    "Detection queue is full. Please retry later.",
+                    null
+            );
+
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                    .header("Retry-After", RETRY_AFTER_SECONDS)
+                    .body(errorDto);
+
+        } catch (Exception e) {
+            requestEntity.setStatus(DetectionProcessingService.STATUS_FAILED);
+            if (requestEntity.getId() != null) {
+                detectionRequestRepository.save(requestEntity);
+            }
+
+            DetectionResponseDto errorDto = new DetectionResponseDto(
+                    requestEntity.getId(),
+                    DetectionProcessingService.STATUS_FAILED,
+                    "Analysis failed: " + e.getMessage(),
+                    null
+            );
 
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(errorDto);
         }
@@ -146,7 +147,7 @@ public class DetectionController {
     public ResponseEntity<?> getDetection(@PathVariable Long requestId) {
         Optional<DetectionRequestEntity> requestOpt = detectionRequestRepository.findById(requestId);
         if (requestOpt.isEmpty()) {
-            return ResponseEntity.status(HttpStatus.NOT_FOUND).body("요청을 찾을 수 없습니다.");
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body("Request not found.");
         }
 
         DetectionRequestEntity requestEntity = requestOpt.get();
@@ -161,40 +162,36 @@ public class DetectionController {
         DetectionResponseDto responseDto = new DetectionResponseDto(
                 requestEntity.getId(),
                 requestEntity.getStatus(),
-                "조회 성공",
-                resultDto);
+                getStatusMessage(requestEntity.getStatus()),
+                resultDto
+        );
 
         return ResponseEntity.ok(responseDto);
     }
 
-    private AiPredictionDto callAiServer(Path filePath, String analysisMode) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+    @PostMapping("/feedback")
+    public ResponseEntity<?> receiveFeedback(@RequestBody FeedbackRequestDto feedbackDto) {
+        log.info("Feedback received - ID: {}, reason: {}", feedbackDto.getRequestId(), feedbackDto.getReason());
 
-        MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
-        body.add("file", new FileSystemResource(filePath.toFile()));
-        body.add("analysisMode", normalizeAnalysisMode(analysisMode));
-
-        HttpEntity<MultiValueMap<String, Object>> requestEntity = new HttpEntity<>(body, headers);
-
-        ResponseEntity<AiPredictionDto> response = restTemplate.exchange(
-                aiServerUrl,
-                HttpMethod.POST,
-                requestEntity,
-                AiPredictionDto.class);
-
-        if (!response.getStatusCode().is2xxSuccessful() || response.getBody() == null) {
-            throw new RuntimeException("AI 서버 응답이 비정상입니다.");
+        Optional<DetectionRequestEntity> requestOpt = detectionRequestRepository.findById(feedbackDto.getRequestId());
+        if (requestOpt.isEmpty()) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(java.util.Map.of("status", "FAILED", "message", "Request not found."));
         }
 
-        return response.getBody();
+        DetectionRequestEntity entity = requestOpt.get();
+        entity.setReported(true);
+        entity.setReportedAt(feedbackDto.getReportedAt());
+        entity.setReportReason(feedbackDto.getReason());
+        detectionRequestRepository.save(entity);
+
+        return ResponseEntity.ok(java.util.Map.of("status", "SUCCESS"));
     }
 
-    private String normalizeAnalysisMode(String analysisMode) {
-        if ("face_crop_only".equals(analysisMode)) {
-            return "face_crop_only";
-        }
-        return "full_image";
+    @GetMapping("/feedback/list")
+    public ResponseEntity<?> getFeedbackList() {
+        List<DetectionRequestEntity> reportedList = detectionRequestRepository.findByIsReportedTrue();
+        return ResponseEntity.ok(reportedList);
     }
 
     private AiPredictionDto deserializeResult(DetectionResultEntity resultEntity) {
@@ -217,8 +214,7 @@ public class DetectionController {
     }
 
     private String truncate(String value, int maxLength) {
-        if (value == null)
-            return null;
+        if (value == null) return null;
         return value.length() <= maxLength ? value : value.substring(0, maxLength);
     }
 
@@ -233,38 +229,25 @@ public class DetectionController {
         return sanitized.isBlank() ? fallback : sanitized;
     }
 
-    @PostMapping("/feedback")
-    public ResponseEntity<?> receiveFeedback(@RequestBody FeedbackRequestDto feedbackDto) {
-        log.info("🚨 오답 신고 접수 - ID: {}, 사유: {}", feedbackDto.getRequestId(), feedbackDto.getReason());
-
-        Optional<DetectionRequestEntity> requestOpt = detectionRequestRepository.findById(feedbackDto.getRequestId());
-
-        if (requestOpt.isPresent()) {
-            DetectionRequestEntity entity = requestOpt.get();
-
-            entity.setReported(true);
-            entity.setReportedAt(feedbackDto.getReportedAt());
-            entity.setReportReason(feedbackDto.getReason());
-
-            detectionRequestRepository.save(entity);
-
-            return ResponseEntity.ok(java.util.Map.of("status", "SUCCESS"));
-        } else {
-            return ResponseEntity.status(HttpStatus.NOT_FOUND)
-                    .body(java.util.Map.of("status", "FAILED", "message", "해당 ID를 찾을 수 없습니다."));
+    private String getStatusMessage(String status) {
+        if (DetectionProcessingService.STATUS_QUEUED.equals(status)) {
+            return "Analysis request is queued.";
         }
+        if (DetectionProcessingService.STATUS_PROCESSING.equals(status)) {
+            return "Analysis is processing.";
+        }
+        if (DetectionProcessingService.STATUS_DONE.equals(status)) {
+            return "Analysis completed.";
+        }
+        if (DetectionProcessingService.STATUS_FAILED.equals(status)) {
+            return "Analysis failed.";
+        }
+        return "Analysis status loaded.";
     }
 
     private String sha256(byte[] bytes) throws Exception {
         MessageDigest md = MessageDigest.getInstance("SHA-256");
         byte[] digest = md.digest(bytes);
         return HexFormat.of().formatHex(digest);
-    }
-
-    @GetMapping("/feedback/list")
-    public ResponseEntity<?> getFeedbackList() {
-        List<DetectionRequestEntity> reportedList = detectionRequestRepository.findByIsReportedTrue();
-
-        return ResponseEntity.ok(reportedList);
     }
 }

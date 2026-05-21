@@ -2,6 +2,7 @@ package com.example.backend_spring.Controller;
 
 import com.example.backend_spring.Dto.AiPredictionDto;
 import com.example.backend_spring.Dto.DetectionResponseDto;
+import com.example.backend_spring.Dto.FeedbackRequestDto;
 import com.example.backend_spring.Entity.DetectionRequestEntity;
 import com.example.backend_spring.Entity.DetectionResultEntity;
 import com.example.backend_spring.Repository.DetectionRequestRepository;
@@ -20,6 +21,7 @@ import org.springframework.util.MultiValueMap;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -34,11 +36,14 @@ import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.List;
 
 @RestController
 @RequestMapping("/api")
+
 public class DetectionController {
 
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(DetectionController.class);
     private final RestTemplate restTemplate;
     private final DetectionRequestRepository detectionRequestRepository;
     private final DetectionResultRepository detectionResultRepository;
@@ -51,9 +56,9 @@ public class DetectionController {
     private String aiServerUrl;
 
     public DetectionController(RestTemplate restTemplate,
-                               DetectionRequestRepository detectionRequestRepository,
-                               DetectionResultRepository detectionResultRepository,
-                               ObjectMapper objectMapper) {
+            DetectionRequestRepository detectionRequestRepository,
+            DetectionResultRepository detectionResultRepository,
+            ObjectMapper objectMapper) {
         this.restTemplate = restTemplate;
         this.detectionRequestRepository = detectionRequestRepository;
         this.detectionResultRepository = detectionResultRepository;
@@ -66,8 +71,7 @@ public class DetectionController {
             @RequestParam(value = "sourceUrl", required = false) String sourceUrl,
             @RequestParam(value = "mediaType", defaultValue = "image") String mediaType,
             @RequestParam(value = "clientType", defaultValue = "chrome-extension") String clientType,
-            @RequestParam(value = "analysisMode", defaultValue = "full_image") String analysisMode
-    ) {
+            @RequestParam(value = "analysisMode", defaultValue = "full_image") String analysisMode) {
         DetectionRequestEntity requestEntity = new DetectionRequestEntity();
 
         try {
@@ -118,8 +122,7 @@ public class DetectionController {
                     requestEntity.getId(),
                     "DONE",
                     "분석 완료",
-                    aiResult
-            );
+                    aiResult);
 
             return ResponseEntity.ok(responseDto);
 
@@ -133,8 +136,7 @@ public class DetectionController {
                     requestEntity.getId(),
                     "FAILED",
                     "분석 실패: " + e.getMessage(),
-                    null
-            );
+                    null);
 
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(errorDto);
         }
@@ -160,8 +162,7 @@ public class DetectionController {
                 requestEntity.getId(),
                 requestEntity.getStatus(),
                 "조회 성공",
-                resultDto
-        );
+                resultDto);
 
         return ResponseEntity.ok(responseDto);
     }
@@ -180,8 +181,7 @@ public class DetectionController {
                 aiServerUrl,
                 HttpMethod.POST,
                 requestEntity,
-                AiPredictionDto.class
-        );
+                AiPredictionDto.class);
 
         if (!response.getStatusCode().is2xxSuccessful() || response.getBody() == null) {
             throw new RuntimeException("AI 서버 응답이 비정상입니다.");
@@ -217,7 +217,8 @@ public class DetectionController {
     }
 
     private String truncate(String value, int maxLength) {
-        if (value == null) return null;
+        if (value == null)
+            return null;
         return value.length() <= maxLength ? value : value.substring(0, maxLength);
     }
 
@@ -232,9 +233,38 @@ public class DetectionController {
         return sanitized.isBlank() ? fallback : sanitized;
     }
 
+    @PostMapping("/feedback")
+    public ResponseEntity<?> receiveFeedback(@RequestBody FeedbackRequestDto feedbackDto) {
+        log.info("🚨 오답 신고 접수 - ID: {}, 사유: {}", feedbackDto.getRequestId(), feedbackDto.getReason());
+
+        Optional<DetectionRequestEntity> requestOpt = detectionRequestRepository.findById(feedbackDto.getRequestId());
+
+        if (requestOpt.isPresent()) {
+            DetectionRequestEntity entity = requestOpt.get();
+
+            entity.setReported(true);
+            entity.setReportedAt(feedbackDto.getReportedAt());
+            entity.setReportReason(feedbackDto.getReason());
+
+            detectionRequestRepository.save(entity);
+
+            return ResponseEntity.ok(java.util.Map.of("status", "SUCCESS"));
+        } else {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(java.util.Map.of("status", "FAILED", "message", "해당 ID를 찾을 수 없습니다."));
+        }
+    }
+
     private String sha256(byte[] bytes) throws Exception {
         MessageDigest md = MessageDigest.getInstance("SHA-256");
         byte[] digest = md.digest(bytes);
         return HexFormat.of().formatHex(digest);
+    }
+
+    @GetMapping("/feedback/list")
+    public ResponseEntity<?> getFeedbackList() {
+        List<DetectionRequestEntity> reportedList = detectionRequestRepository.findByIsReportedTrue();
+
+        return ResponseEntity.ok(reportedList);
     }
 }

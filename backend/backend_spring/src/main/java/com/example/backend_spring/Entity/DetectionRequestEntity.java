@@ -124,4 +124,34 @@ public class DetectionRequestEntity {
     public LocalDateTime getUpdatedAt() {
         return updatedAt;
     }
+
+    private boolean isReported = false; // 신고 여부
+    private String reportedAt; // 신고된 시간
+
+    @Column(columnDefinition = "TEXT")
+    private String reportReason;
+
+    public boolean isReported() {
+        return isReported;
+    }
+
+    public void setReported(boolean reported) {
+        isReported = reported;
+    }
+
+    public String getReportedAt() {
+        return reportedAt;
+    }
+
+    public void setReportedAt(String reportedAt) {
+        this.reportedAt = reportedAt;
+    }
+
+    public String getReportReason() {
+        return reportReason;
+    }
+
+    public void setReportReason(String reportReason) {
+        this.reportReason = reportReason;
+    }
 }

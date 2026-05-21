@@ -20,6 +20,7 @@ public class AiPredictionDto {
     private long processingTimeMs;
     private String message;
     private List<Map<String, Object>> faces;
+    private Map<String, Object> cnn;
     private Map<String, String> debugImages;
 
     @JsonProperty("isDeepfake")
@@ -110,6 +111,14 @@ public class AiPredictionDto {
 
     public void setFaces(List<Map<String, Object>> faces) {
         this.faces = faces;
+    }
+
+    public Map<String, Object> getCnn() {
+        return cnn;
+    }
+
+    public void setCnn(Map<String, Object> cnn) {
+        this.cnn = cnn;
     }
 
     public Map<String, String> getDebugImages() {

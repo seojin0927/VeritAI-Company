@@ -1,6 +1,8 @@
 console.log("VeritAI content script loaded");
 const API_URL = "http://localhost:8080/api/detections";
 const scanCache = new Map();
+const POLL_INTERVAL_MS = 1000;
+const POLL_TIMEOUT_MS = 180000;
 
 let isSystemOn = true; // 시스템 전원
 let isAutoScanMode = false; // 자동 스캔 모드
@@ -630,10 +632,34 @@ async function sendToBackend(blob, mediaType, analysisMode = FACE_CROP_ANALYSIS_
 
     if (!response.ok) throw new Error(`Server response error: ${response.status}`);
     const data = await response.json();
-    if (!data || data.status !== "DONE" || !data.result) {
-        throw new Error(data?.message || "분석이 정상적으로 완료되지 않았습니다.");
+    if (!data) throw new Error("Analysis did not finish normally.");
+    if (data.status === "DONE" && data.result) return data;
+    if ((data.status === "PROCESSING" || data.status === "QUEUED") && data.requestId) {
+        return pollDetectionResult(data.requestId);
     }
-    return data;
+    if (data.status === "FAILED") throw new Error(data?.message || "Analysis failed");
+    throw new Error(data?.message || "Analysis did not finish normally.");
+}
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function pollDetectionResult(requestId) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
+        await delay(POLL_INTERVAL_MS);
+        const response = await fetch(`${API_URL}/${requestId}`);
+        if (!response.ok) throw new Error(`Server response error: ${response.status}`);
+        const data = await response.json();
+        if (data?.status === "DONE" && data.result) {
+            return data;
+        }
+        if (data?.status === "FAILED") {
+            throw new Error(data?.message || "Analysis failed");
+        }
+    }
+    throw new Error("Analysis timed out.");
 }
 
 document.addEventListener('keydown', (e) => {

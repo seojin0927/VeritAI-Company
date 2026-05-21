@@ -1,6 +1,15 @@
 package com.example.backend_spring.Entity;
 
-import jakarta.persistence.*;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Lob;
+import jakarta.persistence.PrePersist;
+import jakarta.persistence.PreUpdate;
+import jakarta.persistence.Table;
+
 import java.time.LocalDateTime;
 
 @Entity
@@ -23,6 +32,13 @@ public class DetectionRequestEntity {
     private String mimeType;
     private Long fileSize;
     private String status;
+    private String analysisMode;
+
+    private boolean isReported = false;
+    private String reportedAt;
+
+    @Column(columnDefinition = "TEXT")
+    private String reportReason;
 
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
@@ -117,19 +133,13 @@ public class DetectionRequestEntity {
         this.status = status;
     }
 
-    public LocalDateTime getCreatedAt() {
-        return createdAt;
+    public String getAnalysisMode() {
+        return analysisMode;
     }
 
-    public LocalDateTime getUpdatedAt() {
-        return updatedAt;
+    public void setAnalysisMode(String analysisMode) {
+        this.analysisMode = analysisMode;
     }
-
-    private boolean isReported = false; // 신고 여부
-    private String reportedAt; // 신고된 시간
-
-    @Column(columnDefinition = "TEXT")
-    private String reportReason;
 
     public boolean isReported() {
         return isReported;
@@ -153,5 +163,13 @@ public class DetectionRequestEntity {
 
     public void setReportReason(String reportReason) {
         this.reportReason = reportReason;
+    }
+
+    public LocalDateTime getCreatedAt() {
+        return createdAt;
+    }
+
+    public LocalDateTime getUpdatedAt() {
+        return updatedAt;
     }
 }

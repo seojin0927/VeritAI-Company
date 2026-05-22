@@ -50,6 +50,8 @@ function updateStatusBadge(media, status, data = null) {
     const wrapper = ensureWrapper(media);
     if (!wrapper) return;
 
+    if (!media.dataset.veritaiScanned && status !== "loading") return;
+
     const existingContainers = wrapper.querySelectorAll('.veritai-ui-container');
     if (existingContainers.length > 1) {
         existingContainers.forEach(c => c.remove());
@@ -59,9 +61,14 @@ function updateStatusBadge(media, status, data = null) {
     if (!uiContainer) {
         uiContainer = document.createElement('div');
         uiContainer.className = 'veritai-ui-container';
+
         uiContainer.style.cssText = `
-            position: absolute; top: 6px; left: 6px; z-index: 2147483647;
+            position: absolute; 
+            top: 6px; 
+            left: 6px; 
+            z-index: 2147483647;
             display: flex; flex-direction: column; align-items: flex-start;
+            pointer-events: none; 
         `;
         wrapper.appendChild(uiContainer);
     }
@@ -70,16 +77,20 @@ function updateStatusBadge(media, status, data = null) {
     if (!badge) {
         badge = document.createElement('div');
         badge.className = 'veritai-status-badge';
-        badge.style.cssText = `
-            padding: 4px 8px; border-radius: 4px; color: white; font-size: 11px; 
-            font-weight: bold; font-family: sans-serif; box-shadow: 0 2px 4px rgba(0,0,0,0.5);
-            transition: all 0.2s ease; user-select: none;
-        `;
         uiContainer.appendChild(badge);
     }
 
     badge.onclick = null;
-    badge.style.cursor = "default";
+    badge.onmouseenter = null;
+    badge.onmouseleave = null;
+    badge.dataset.pinned = "false"; 
+    
+    badge.style.cssText = `
+        padding: 4px 8px; border-radius: 4px; color: white; font-size: 11px; 
+        font-weight: bold; font-family: sans-serif; box-shadow: 0 2px 4px rgba(0,0,0,0.5);
+        transition: all 0.2s ease; user-select: none; cursor: default;
+        pointer-events: auto; 
+    `;
     media.style.border = "none";
 
     if (status === "loading") {
@@ -106,7 +117,6 @@ function updateStatusBadge(media, status, data = null) {
             badge.style.background = "red";
             badge.style.borderRadius = "4px";
             badge.style.padding = "4px 8px";
-
             media.style.border = "2px solid red";
         } else {
             badge.innerText = "✓";
@@ -121,27 +131,32 @@ function updateStatusBadge(media, status, data = null) {
             badge.style.fontSize = "12px";
             badge.style.padding = "0";
             badge.style.fontWeight = "bold";
-
             media.style.border = "none";
             media.style.boxShadow = "inset 4px 0 0 rgba(0, 200, 0, 0.8)";
-
             badge.style.opacity = "0.4";
-            badge.onmouseenter = () => badge.style.opacity = "1";
-            badge.onmouseleave = () => badge.style.opacity = "0.4";
         }
 
-        badge.onclick = (e) => {
-            e.preventDefault();
-            e.stopPropagation();
+        const showReportBox = (e) => {
+            if(e) {
+                e.preventDefault();
+                e.stopPropagation();
+            }
 
+            const mediaSrc = media.currentSrc || media.src || "unknown_media";
             const existingBox = document.querySelector('.veritai-details-box');
-            if (existingBox) {
-                if (existingBox.parentNode) {
-                    existingBox.parentNode.removeChild(existingBox);
+            
+            if (e && e.type === "click") {
+                if (badge.dataset.pinned === "true") {
+                    badge.dataset.pinned = "false";
+                    if (existingBox) existingBox.remove();
+                    return;
                 } else {
-                    existingBox.remove();
+                    badge.dataset.pinned = "true";
                 }
-                if (existingBox.dataset.targetMedia === (media.currentSrc || media.src)) return;
+            } else if (existingBox && badge.dataset.pinned === "true") {
+                return;
+            } else if (existingBox) {
+                existingBox.remove();
             }
 
             const result = data.result;
@@ -154,37 +169,20 @@ function updateStatusBadge(media, status, data = null) {
                     const qualScore = ((quality.score || 0) * 100).toFixed(1);
                     return `<span style="color:yellow; font-weight:bold;">[얼굴 ${i + 1}]</span>
  - 유형: ${f.faceMode || '?'}
- - 검출 신뢰도: ${detConf}%
+ - 얼굴 검출률: ${detConf}%
  - 위치: (${bbox.x ?? '?'}, ${bbox.y ?? '?'}, ${bbox.w ?? '?'}x${bbox.h ?? '?'})
  - 품질: ${quality.label || '?'} (${qualScore}%)`;
                 }).join("\n\n");
 
             const detailsBox = document.createElement('div');
             detailsBox.className = 'veritai-details-box';
-            detailsBox.dataset.targetMedia = media.currentSrc || media.src;
-
-            const badgeRect = badge.getBoundingClientRect();
-            const boxWidth = 280;
-            const boxMaxHeight = 400;
-
-            let leftPos = badgeRect.left;
-            if (leftPos + boxWidth > window.innerWidth) {
-                leftPos = window.innerWidth - boxWidth - 10;
-            }
-
-            let topPos = badgeRect.bottom + 5;
-            if (topPos + boxMaxHeight > window.innerHeight) {
-                topPos = badgeRect.top - boxMaxHeight - 5;
-
-                if (topPos < 0) {
-                    topPos = 50;
-                }
-            }
+            detailsBox.dataset.targetMedia = mediaSrc;
 
             Object.assign(detailsBox.style, {
-                position: "fixed",
-                top: `${topPos}px`,
-                left: `${leftPos}px`,
+                position: "absolute",
+                top: "0px",  
+                left: "0px", 
+                willChange: "transform", 
                 zIndex: "2147483647",
                 background: "black",
                 backdropFilter: "blur(10px)",
@@ -195,52 +193,98 @@ function updateStatusBadge(media, status, data = null) {
                 fontSize: "12px",
                 whiteSpace: "pre-wrap",
                 lineHeight: "1.6",
-                boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.7)",
+                boxShadow: badge.dataset.pinned === "true" 
+                    ? `0 0 15px ${status === "fake" ? "rgba(255,0,0,0.6)" : "rgba(0,255,0,0.6)"}`
+                    : "0 20px 25px -5px rgba(0, 0, 0, 0.7)",
                 fontFamily: "monospace",
                 width: "280px",
                 maxHeight: "400px",
                 overflowY: "auto",
                 textAlign: "left",
                 cursor: "default",
-                pointerEvents: "auto"
+                pointerEvents: "auto",
+                transition: "box-shadow 0.3s ease" 
             });
 
             detailsBox.innerHTML = `
-                <div style="color:lightskyblue; font-weight:bold; margin-bottom:10px; border-bottom:1px solid grey; padding-bottom:6px; font-size:14px; display:flex; justify-content:space-between; align-items: center;">
-                    <span>🔍 분석 리포트</span>
-                    <span class="veritai-close-btn" style="cursor:pointer; color:gray; padding: 0 5px;">✕</span>
+<div style="color:lightskyblue; font-weight:bold; margin-bottom:10px; border-bottom:1px solid grey; padding-bottom:6px; font-size:14px; display:flex; justify-content:space-between; align-items: center;">
+    <span>🔍 분석 리포트 ${badge.dataset.pinned === "true" ? "📌" : ""}</span>
+    <span class="veritai-close-btn" style="cursor:pointer; color:gray; padding: 0 5px; font-size: 16px;">✕</span>
 </div>
-<b>ID:</b> ${data.requestId}
-<b>판정:</b> ${readDeepfakeFlag(result) ? "<span style='color:crimson; font-weight:bold;'>조작 의심</span>" : "<span style='color:green; font-weight:bold;'>정상</span>"} (${((result.confidence || 0) * 100).toFixed(1)}%)
-<b>시간:</b> ${result.processingTimeMs}ms
+<b>ID:</b> ${data.requestId || 'N/A'}
+<b>판정:</b> ${readDeepfakeFlag(result) ? "<span style='color:crimson; font-weight:bold;'>조작 의심</span>" : "<span style='color:lightgreen; font-weight:bold;'>정상</span>"}
+<b>딥페이크 분석률:</b> ${((result.confidence || 0) * 100).toFixed(1)}%
+<b>시간:</b> ${result.processingTimeMs || 0}ms
 <b>얼굴 수:</b> ${result.faceCount || faces.length}명
 <div style="margin:10px 0; border-top:1px dashed grey;"></div>
 ${faceText}
+
 <div style="margin-top: 15px; display: flex; justify-content: flex-end;">
-<button class="veritai-feedback-btn" style="
-    background: rgba(255, 60, 60, 0.1); 
-    border: 1px solid rgba(255, 60, 60, 0.3); 
-    color: #ff6b6b; 
-    border-radius: 20px; 
-    cursor: pointer; 
-    font-size: 11px; 
-    font-weight: bold; 
-    width: 90px !important; 
-    height: 30px; 
-    display: flex; 
-    align-items: center; 
-    justify-content: center;
-">🚨 신고</button>
+    <button class="veritai-feedback-btn" style="
+        background: rgba(255, 60, 60, 0.1); 
+        border: 1px solid rgba(255, 60, 60, 0.3); 
+        color: #ff6b6b; 
+        border-radius: 20px; 
+        cursor: pointer; 
+        font-size: 11px; 
+        font-weight: bold; 
+        width: 90px !important; 
+        height: 30px; 
+        display: flex; 
+        align-items: center; 
+        justify-content: center;
+    ">🚨 오답 신고</button>
 </div>
             `.trim();
 
             detailsBox.onclick = (evt) => evt.stopPropagation();
+            detailsBox.onmouseenter = () => { detailsBox.dataset.isHovered = "true"; };
+            detailsBox.onmouseleave = () => { 
+                detailsBox.dataset.isHovered = "false"; 
+                if (status === "real" && badge.dataset.pinned !== "true") {
+                    setTimeout(() => {
+                        if (detailsBox.dataset.isHovered !== "true" && badge.dataset.isHovered !== "true") {
+                            badge.dataset.pinned = "false";
+                            detailsBox.remove();
+                        }
+                    }, 400); 
+                }
+            };
+
             document.body.appendChild(detailsBox);
+
+            const updatePosition = () => {
+                if (!document.body.contains(detailsBox)) return; 
+                
+                const badgeRect = badge.getBoundingClientRect();
+                const boxWidth = 280;
+                const boxMaxHeight = 400;
+
+                let leftPos = badgeRect.left + window.scrollX;
+                if (leftPos + boxWidth > window.innerWidth + window.scrollX) {
+                    leftPos = window.innerWidth + window.scrollX - boxWidth - 10;
+                }
+
+                let topPos = badgeRect.bottom + window.scrollY + 5;
+                if (badgeRect.bottom + boxMaxHeight > window.innerHeight) {
+                    topPos = badgeRect.top + window.scrollY - detailsBox.offsetHeight - 5;
+                    if (topPos < window.scrollY) {
+                        topPos = window.scrollY + 50;
+                    }
+                }
+
+                detailsBox.style.transform = `translate3d(${leftPos}px, ${topPos}px, 0)`;
+
+                requestAnimationFrame(updatePosition); 
+            };
+            requestAnimationFrame(updatePosition);
 
             const closeBtn = detailsBox.querySelector('.veritai-close-btn');
             if (closeBtn) {
-                closeBtn.addEventListener('click', (e) => {
-                    e.stopPropagation();
+                closeBtn.addEventListener('click', (evt) => {
+                    evt.preventDefault();
+                    evt.stopImmediatePropagation();
+                    badge.dataset.pinned = "false"; 
                     detailsBox.remove();
                 });
             }
@@ -257,37 +301,27 @@ ${faceText}
                 feedbackBtn.onclick = (e) => {
                     e.stopPropagation();
                     if (feedbackBtn.disabled) return;
-
                     feedbackBtn.style.display = 'none';
 
                     const reasonContainer = document.createElement('div');
                     reasonContainer.style.cssText = 'display: flex; flex-direction: column; gap: 5px; margin-top: 5px; width: 100%;';
-
                     const reasonInput = document.createElement('textarea');
                     reasonInput.placeholder = "어떤 부분이 잘못되었나요?";
-                    reasonInput.style.cssText = `
-        font-size: 11px; padding: 5px; border-radius: 4px; 
-        border: 1px solid #555; background: #222; color: white;
-        resize: none; height: 40px; font-family: sans-serif;
-    `;
-
+                    reasonInput.style.cssText = `font-size: 11px; padding: 5px; border-radius: 4px; border: 1px solid #555; background: #222; color: white; resize: none; height: 40px; font-family: sans-serif;`;
+                    
                     const actionContainer = document.createElement('div');
                     actionContainer.style.cssText = 'display: flex; justify-content: flex-end; gap: 5px;';
-
                     const cancelBtn = document.createElement('button');
                     cancelBtn.innerText = "취소";
                     cancelBtn.style.cssText = 'font-size: 11px; padding: 2px 8px; cursor: pointer; background: #444; color: white; border: none; border-radius: 3px;';
-
                     const submitBtn = document.createElement('button');
                     submitBtn.innerText = "제출";
                     submitBtn.style.cssText = 'font-size: 11px; padding: 2px 8px; cursor: pointer; background: #ff6b6b; color: white; border: none; border-radius: 3px; font-weight: bold;';
 
                     actionContainer.appendChild(cancelBtn);
                     actionContainer.appendChild(submitBtn);
-
                     reasonContainer.appendChild(reasonInput);
                     reasonContainer.appendChild(actionContainer);
-
                     feedbackBtn.parentNode.appendChild(reasonContainer);
 
                     cancelBtn.onclick = (cancelEvent) => {
@@ -298,14 +332,12 @@ ${faceText}
 
                     submitBtn.onclick = async (submitEvent) => {
                         submitEvent.stopPropagation();
-
                         const textReason = reasonInput.value.trim();
                         if (!textReason) {
                             reasonInput.style.border = "1px solid red";
                             reasonInput.placeholder = "신고 이유를 적어주세요.";
                             return;
                         }
-
                         submitBtn.innerText = "전송 중...";
                         submitBtn.disabled = true;
                         cancelBtn.disabled = true;
@@ -321,10 +353,8 @@ ${faceText}
                                     reason: textReason
                                 })
                             });
-
                             if (!response.ok) throw new Error("전송 실패");
-
-                            reasonContainer.innerHTML = "<span style='color: lightgreen; font-size: 11px; text-align: right;'>소중한 피드백이 접수되었습니다!</span>";
+                            reasonContainer.innerHTML = "<span style='color: lightgreen; font-size: 11px; text-align: right;'>피드백이 접수되었습니다!</span>";
                         } catch (err) {
                             submitBtn.innerText = "실패(재시도)";
                             submitBtn.disabled = false;
@@ -332,16 +362,39 @@ ${faceText}
                         }
                     };
                 };
+            };
 
-                setTimeout(() => {
-                    const closeDetails = (evt) => {
-                        if (!detailsBox.contains(evt.target) && !badge.contains(evt.target)) {
-                            detailsBox.remove();
-                            document.removeEventListener('click', closeDetails);
+            setTimeout(() => {
+                const closeDetails = (evt) => {
+                    if (!detailsBox.contains(evt.target) && !badge.contains(evt.target)) {
+                        badge.dataset.pinned = "false";
+                        detailsBox.remove();
+                        document.removeEventListener('click', closeDetails);
+                    }
+                };
+                document.addEventListener('click', closeDetails);
+            }, 10);
+        };
+
+        badge.onclick = (e) => showReportBox(e);
+
+        if (status === "real") {
+            badge.onmouseenter = (e) => {
+                badge.style.opacity = "1";
+                badge.dataset.isHovered = "true";
+                showReportBox(e);
+            };
+            badge.onmouseleave = () => {
+                badge.dataset.isHovered = "false";
+                if (badge.dataset.pinned !== "true") {
+                    badge.style.opacity = "0.4";
+                    setTimeout(() => {
+                        const existingBox = document.querySelector('.veritai-details-box');
+                        if (existingBox && existingBox.dataset.isHovered !== "true" && badge.dataset.isHovered !== "true" && badge.dataset.pinned !== "true") {
+                            existingBox.remove();
                         }
-                    };
-                    document.addEventListener('click', closeDetails);
-                }, 10);
+                    }, 400); 
+                }
             };
         }
     }
@@ -389,6 +442,11 @@ async function startInspection(media) {
         }
 
         const data = await sendToBackend(blob, mediaType);
+
+        if (!media.dataset.veritaiScanned) {
+            console.log("검사 중지됨: 로딩 중 모드가 해제되었습니다.");
+            return; 
+        }
 
         if (mediaUrl) {
             scanCache.set(mediaUrl, data);
@@ -495,14 +553,17 @@ function attachUI(media) {
             const btn = document.createElement("button");
             btn.innerText = "🔍 검사";
             btn.className = "veritai-check-btn";
+            
             btn.style.cssText = `
-                position: absolute; top: 10px; left: 10px; z-index: 2147483647;
+                position: absolute; 
+                top: 8px; 
+                left: 8px; 
+                z-index: 2147483647;
                 padding: 4px 8px; background-color: rgba(25, 25, 112, 0.8); color: aqua;
                 border: 1px solid aqua; border-radius: 999px; cursor: pointer;
                 font-weight: bold; font-size: 11px; backdrop-filter: blur(2px);
-                transition: all 0.2s ease;
+                transition: background-color 0.2s ease;
             `;
-
             btn.onmouseenter = () => btn.style.backgroundColor = "rgba(25, 25, 112, 1)";
             btn.onmouseleave = () => btn.style.backgroundColor = "rgba(25, 25, 112, 0.8)";
 

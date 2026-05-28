@@ -31,12 +31,15 @@ function syncState() {
     chrome.storage.local.set(state);
     
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        if (tabs[0]?.id) {
-            chrome.tabs.sendMessage(tabs[0].id, { action: "TOGGLE_SYSTEM", ...state });
+        if (tabs[0]?.id && tabs[0].url && !tabs[0].url.startsWith('chrome://')) {
+            chrome.tabs.sendMessage(tabs[0].id, { action: "TOGGLE_SYSTEM", ...state }, (response) => {
+                if (chrome.runtime.lastError) {
+                    console.log("현재 탭에서는 확장프로그램이 비활성화되어 있습니다.");
+                }
+            });
         }
     });
 }
-
 systemToggle.addEventListener('change', syncState);
 autoToggle.addEventListener('change', syncState);
 

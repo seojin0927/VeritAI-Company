@@ -6,6 +6,7 @@ public class DetectionResponseDto {
     private String status;
     private String message;
     private AiPredictionDto result;
+    private Integer retryAfterMs;
 
     public DetectionResponseDto() {
     }
@@ -15,6 +16,14 @@ public class DetectionResponseDto {
         this.status = status;
         this.message = message;
         this.result = result;
+    }
+
+    public DetectionResponseDto(Long requestId, String status, String message, AiPredictionDto result, Integer retryAfterMs) {
+        this.requestId = requestId;
+        this.status = status;
+        this.message = message;
+        this.result = result;
+        this.retryAfterMs = retryAfterMs;
     }
 
     public Long getRequestId() {
@@ -47,5 +56,13 @@ public class DetectionResponseDto {
 
     public void setMessage(String message) {
         this.message = message;
+    }
+
+    public Integer getRetryAfterMs() {
+        return retryAfterMs;
+    }
+
+    public void setRetryAfterMs(Integer retryAfterMs) {
+        this.retryAfterMs = retryAfterMs;
     }
 }

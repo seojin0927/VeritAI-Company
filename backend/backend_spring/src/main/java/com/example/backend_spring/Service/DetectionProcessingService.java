@@ -24,11 +24,15 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Service
 public class DetectionProcessingService {
@@ -43,7 +47,16 @@ public class DetectionProcessingService {
     private final DetectionResultRepository detectionResultRepository;
     private final ObjectMapper objectMapper;
     private final BlockingQueue<DetectionJob> queue;
+    private final int queueCapacity;
     private final List<Thread> workers = new ArrayList<>();
+    private final AtomicInteger activeProcessingCount = new AtomicInteger(0);
+    private final AtomicLong totalEnqueuedCount = new AtomicLong(0);
+    private final AtomicLong totalCompletedCount = new AtomicLong(0);
+    private final AtomicLong totalFailedCount = new AtomicLong(0);
+    private final AtomicLong totalAiCallCount = new AtomicLong(0);
+    private final AtomicLong totalRetryCount = new AtomicLong(0);
+    private final AtomicLong totalProcessingTimeMs = new AtomicLong(0);
+    private final AtomicLong totalAiCallTimeMs = new AtomicLong(0);
 
     @Value("${app.ai-server-url}")
     private String aiServerUrl;
@@ -68,6 +81,7 @@ public class DetectionProcessingService {
         this.detectionRequestRepository = detectionRequestRepository;
         this.detectionResultRepository = detectionResultRepository;
         this.objectMapper = objectMapper;
+        this.queueCapacity = queueCapacity;
         this.queue = new ArrayBlockingQueue<>(queueCapacity);
     }
 
@@ -96,6 +110,7 @@ public class DetectionProcessingService {
         if (!queue.offer(job)) {
             throw new QueueFullException("Detection queue is full.");
         }
+        totalEnqueuedCount.incrementAndGet();
     }
 
     private void runWorker() {
@@ -112,6 +127,8 @@ public class DetectionProcessingService {
     }
 
     private void processJob(DetectionJob job) {
+        long processingStarted = System.currentTimeMillis();
+        activeProcessingCount.incrementAndGet();
         try {
             DetectionRequestEntity requestEntity = detectionRequestRepository.findById(job.requestId())
                     .orElseThrow(() -> new IllegalStateException("Detection request not found: " + job.requestId()));
@@ -119,6 +136,7 @@ public class DetectionProcessingService {
             if (detectionResultRepository.findByRequestId(job.requestId()).isPresent()) {
                 requestEntity.setStatus(STATUS_DONE);
                 detectionRequestRepository.save(requestEntity);
+                totalCompletedCount.incrementAndGet();
                 return;
             }
 
@@ -141,6 +159,7 @@ public class DetectionProcessingService {
 
             requestEntity.setStatus(STATUS_DONE);
             detectionRequestRepository.save(requestEntity);
+            totalCompletedCount.incrementAndGet();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             detectionRequestRepository.findById(job.requestId()).ifPresent(requestEntity -> {
@@ -152,6 +171,10 @@ public class DetectionProcessingService {
                 requestEntity.setStatus(STATUS_FAILED);
                 detectionRequestRepository.save(requestEntity);
             });
+            totalFailedCount.incrementAndGet();
+        } finally {
+            activeProcessingCount.decrementAndGet();
+            totalProcessingTimeMs.addAndGet(Math.max(0, System.currentTimeMillis() - processingStarted));
         }
     }
 
@@ -181,6 +204,7 @@ public class DetectionProcessingService {
             ))) {
                 break;
             }
+            totalEnqueuedCount.incrementAndGet();
         }
     }
 
@@ -189,10 +213,15 @@ public class DetectionProcessingService {
         RuntimeException lastError = null;
         for (int attempt = 1; attempt <= attempts; attempt += 1) {
             try {
-                return callAiServer(filePath, analysisMode);
+                totalAiCallCount.incrementAndGet();
+                long aiStarted = System.currentTimeMillis();
+                AiPredictionDto result = callAiServer(filePath, analysisMode);
+                totalAiCallTimeMs.addAndGet(Math.max(0, System.currentTimeMillis() - aiStarted));
+                return result;
             } catch (RuntimeException e) {
                 lastError = e;
                 if (attempt < attempts) {
+                    totalRetryCount.incrementAndGet();
                     Thread.sleep(Math.max(0, aiRetryDelayMs));
                 }
             }
@@ -229,6 +258,46 @@ public class DetectionProcessingService {
             return "face_crop_only";
         }
         return "full_image";
+    }
+
+    public int recommendedPollDelayMs() {
+        int queued = queue.size();
+        if (queued >= Math.max(1, queueCapacity * 0.8)) {
+            return 5000;
+        }
+        if (queued >= Math.max(1, queueCapacity * 0.5)) {
+            return 3000;
+        }
+        if (queued > workerCount) {
+            return 2000;
+        }
+        return 1000;
+    }
+
+    public Map<String, Object> getQueueMetrics() {
+        long completed = totalCompletedCount.get();
+        long aiCalls = totalAiCallCount.get();
+        long avgProcessingMs = completed == 0 ? 0 : totalProcessingTimeMs.get() / completed;
+        long avgAiCallMs = aiCalls == 0 ? 0 : totalAiCallTimeMs.get() / aiCalls;
+        int workers = Math.max(1, workerCount);
+        long estimatedWaitMs = avgProcessingMs == 0 ? 0 : ((long) Math.ceil(queue.size() / (double) workers)) * avgProcessingMs;
+        Map<String, Object> metrics = new LinkedHashMap<>();
+        metrics.put("queueCapacity", queueCapacity);
+        metrics.put("queuedCount", queue.size());
+        metrics.put("remainingCapacity", queue.remainingCapacity());
+        metrics.put("workerCount", workers);
+        metrics.put("activeProcessingCount", activeProcessingCount.get());
+        metrics.put("running", running);
+        metrics.put("totalEnqueuedCount", totalEnqueuedCount.get());
+        metrics.put("totalCompletedCount", totalCompletedCount.get());
+        metrics.put("totalFailedCount", totalFailedCount.get());
+        metrics.put("totalAiCallCount", totalAiCallCount.get());
+        metrics.put("totalRetryCount", totalRetryCount.get());
+        metrics.put("avgProcessingTimeMs", avgProcessingMs);
+        metrics.put("avgAiCallTimeMs", avgAiCallMs);
+        metrics.put("estimatedWaitMs", estimatedWaitMs);
+        metrics.put("recommendedPollDelayMs", recommendedPollDelayMs());
+        return metrics;
     }
 
     private record DetectionJob(Long requestId, String filePath, String analysisMode) {

@@ -4721,7 +4721,7 @@ def _detect_service_face_candidates(img, preprocessed):
     return []
 
 
-def prepare_service_cnn_inputs(image_bgr, analysis_mode="face_crop_only", crop_zip_mode=False):
+def prepare_service_cnn_inputs(image_bgr, analysis_mode="face_crop_only", crop_zip_mode=False, timings=None):
     """
     POST /predict 및 crop_all --pipeline service 에서 사용.
 
@@ -4733,11 +4733,24 @@ def prepare_service_cnn_inputs(image_bgr, analysis_mode="face_crop_only", crop_z
     if image_bgr is None or image_bgr.size == 0:
         return None, [], {}
 
+    resize_started = time.time()
     img = _resize_for_service(image_bgr)
+    if timings is not None:
+        timings["resizeTimeMs"] = int((time.time() - resize_started) * 1000)
+
+    preprocess_started = time.time()
     preprocessed = preprocess_image(img)
+    if timings is not None:
+        timings["preprocessTimeMs"] = int((time.time() - preprocess_started) * 1000)
+
+    candidate_started = time.time()
     candidates = _detect_service_face_candidates(img, preprocessed)
+    if timings is not None:
+        timings["candidateDetectionTimeMs"] = int((time.time() - candidate_started) * 1000)
+        timings["candidateCount"] = len(candidates)
 
     if crop_zip_mode:
+        bbox_started = time.time()
         faces = []
         for candidate in candidates:
             face_region = extract_face_region(
@@ -4760,24 +4773,37 @@ def prepare_service_cnn_inputs(image_bgr, analysis_mode="face_crop_only", crop_z
                     }
                 }
             )
+        if timings is not None:
+            timings["bboxExtractionTimeMs"] = int((time.time() - bbox_started) * 1000)
         return img, faces, {}
 
     request_uid = uuid.uuid4().hex[:12]
+    face_output_started = time.time()
     faces, debug_maps = build_face_output(img, preprocessed, candidates, request_uid, analysis_mode)
+    if timings is not None:
+        timings["faceOutputTimeMs"] = int((time.time() - face_output_started) * 1000)
+    rescue_time_ms = 0
     if not faces and candidates:
         for rescue_detector in (
             detect_with_landmark_consensus,
             detect_with_mediapipe_landmarker,
             detect_with_yunet,
         ):
+            rescue_started = time.time()
             rescue_candidates = rescue_detector(preprocessed)
+            rescue_time_ms += int((time.time() - rescue_started) * 1000)
             if not rescue_candidates:
                 continue
+            rescue_build_started = time.time()
             faces, debug_maps = build_face_output(
                 img, preprocessed, rescue_candidates, request_uid, analysis_mode
             )
+            rescue_time_ms += int((time.time() - rescue_build_started) * 1000)
             if faces:
                 break
+    if timings is not None:
+        timings["rescueTimeMs"] = rescue_time_ms
+        timings["faceCountAfterAnalysis"] = len(faces)
     return img, faces, debug_maps
 
 
@@ -4786,15 +4812,21 @@ async def predict(file: UploadFile = File(...), analysisMode: str = Form("full_i
     start = time.time()
     normalized_mode = analysisMode if analysisMode in {"full_image", "face_crop_only"} else "full_image"
     mode_label = "face crop only" if normalized_mode == "face_crop_only" else "full image"
+    read_started = time.time()
     contents = await file.read()
+    read_time_ms = int((time.time() - read_started) * 1000)
+    decode_started = time.time()
     img = decode_image(contents)
+    decode_time_ms = int((time.time() - decode_started) * 1000)
     if img is None:
-        return {"isDeepfake": False, "confidence": 0.0, "faceCount": 0, "watermarkDetected": False, "modelVersion": "veritai-pose-aware-anchor-graph-v1", "analysisMode": normalized_mode, "analysisInput": {"detectionImage": "full_image", "featureImage": "cropped_face", "deepfakeImage": "cropped_face"} if normalized_mode == "face_crop_only" else {"detectionImage": "full_image", "featureImage": "full_image", "deepfakeImage": "full_image"}, "processingTimeMs": 0, "message": f"{mode_label}: image decoding failed.", "faces": [], "debugImages": {}}
+        return {"isDeepfake": False, "confidence": 0.0, "faceCount": 0, "watermarkDetected": False, "modelVersion": "veritai-pose-aware-anchor-graph-v1", "analysisMode": normalized_mode, "analysisInput": {"detectionImage": "full_image", "featureImage": "cropped_face", "deepfakeImage": "cropped_face"} if normalized_mode == "face_crop_only" else {"detectionImage": "full_image", "featureImage": "full_image", "deepfakeImage": "full_image"}, "timings": {"imageReadTimeMs": read_time_ms, "decodeTimeMs": decode_time_ms, "totalTimeMs": int((time.time() - start) * 1000)}, "processingTimeMs": 0, "message": f"{mode_label}: image decoding failed.", "faces": [], "debugImages": {}}
     detection_started = time.time()
-    img, faces, debug_maps = prepare_service_cnn_inputs(img, normalized_mode)
+    service_timings = {}
+    img, faces, debug_maps = prepare_service_cnn_inputs(img, normalized_mode, timings=service_timings)
     detection_time_ms = int((time.time() - detection_started) * 1000)
-    face_analysis_time_ms = 0
+    face_analysis_time_ms = service_timings.get("faceOutputTimeMs", 0) + service_timings.get("rescueTimeMs", 0)
     request_uid, debug_paths = make_debug_paths()
+    debug_started = time.time()
     if DEBUG_ARTIFACTS:
         draw_face_overlay(img, faces, debug_paths["overlay"])
         draw_analysis_map(img, faces, debug_paths["analysisMap"])
@@ -4802,6 +4834,7 @@ async def predict(file: UploadFile = File(...), analysisMode: str = Form("full_i
         draw_response_map(img, debug_maps["nose"], debug_paths["noseResponse"], "Nose Response Map")
         draw_response_map(img, debug_maps["mouth"], debug_paths["mouthResponse"], "Mouth Response Map")
         save_debug_metadata(request_uid, faces, debug_paths)
+    debug_time_ms = int((time.time() - debug_started) * 1000)
     cnn_started = time.time()
     cnn_result = run_cnn_prediction(img, faces)
     cnn_time_ms = int((time.time() - cnn_started) * 1000)
@@ -4834,7 +4867,7 @@ async def predict(file: UploadFile = File(...), analysisMode: str = Form("full_i
         "modelVersion": model_version,
         "analysisMode": normalized_mode,
         "analysisInput": {"detectionImage": "full_image", "featureImage": "cropped_face", "deepfakeImage": "cropped_face"} if normalized_mode == "face_crop_only" else {"detectionImage": "full_image", "featureImage": "full_image", "deepfakeImage": "full_image"},
-        "timings": {"detectionTimeMs": detection_time_ms, "faceAnalysisTimeMs": face_analysis_time_ms, "cnnTimeMs": cnn_time_ms, "totalTimeMs": processing_time_ms},
+        "timings": {"imageReadTimeMs": read_time_ms, "decodeTimeMs": decode_time_ms, **service_timings, "detectionTimeMs": detection_time_ms, "faceAnalysisTimeMs": face_analysis_time_ms, "debugArtifactTimeMs": debug_time_ms, "cnnTimeMs": cnn_time_ms, "totalTimeMs": processing_time_ms},
         "processingTimeMs": processing_time_ms,
         "message": message,
         "faces": faces,

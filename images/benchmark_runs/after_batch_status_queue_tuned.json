@@ -1,0 +1,17 @@
+﻿{
+    "queueCapacity":  100,
+    "queuedCount":  0,
+    "remainingCapacity":  100,
+    "workerCount":  2,
+    "activeProcessingCount":  0,
+    "running":  true,
+    "totalEnqueuedCount":  40,
+    "totalCompletedCount":  39,
+    "totalFailedCount":  1,
+    "totalAiCallCount":  41,
+    "totalRetryCount":  1,
+    "avgProcessingTimeMs":  295,
+    "avgAiCallTimeMs":  247,
+    "estimatedWaitMs":  0,
+    "recommendedPollDelayMs":  1000
+}

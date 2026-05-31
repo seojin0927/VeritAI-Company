@@ -1,0 +1,336 @@
+﻿{
+  "summary": {
+    "count": 40,
+    "elapsedMs": 1681,
+    "done": 40,
+    "failed": 0,
+    "uniqueRequestIds": 1,
+    "totalMsAvg": 413.35,
+    "totalMsP50": 107.0,
+    "totalMsP95": 1370.0,
+    "submitMsAvg": 156.9,
+    "pollsTotal": 10
+  },
+  "results": [
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 343,
+      "totalMs": 1366,
+      "polls": 1,
+      "httpStatus": 202
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 343,
+      "totalMs": 1365,
+      "polls": 1,
+      "httpStatus": 202
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 345,
+      "totalMs": 1368,
+      "polls": 1,
+      "httpStatus": 202
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 343,
+      "totalMs": 1367,
+      "polls": 1,
+      "httpStatus": 202
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 343,
+      "totalMs": 1366,
+      "polls": 1,
+      "httpStatus": 202
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 342,
+      "totalMs": 1367,
+      "polls": 1,
+      "httpStatus": 202
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 342,
+      "totalMs": 1368,
+      "polls": 1,
+      "httpStatus": 202
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 344,
+      "totalMs": 1370,
+      "polls": 1,
+      "httpStatus": 202
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 343,
+      "totalMs": 1376,
+      "polls": 1,
+      "httpStatus": 202
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 344,
+      "totalMs": 1377,
+      "polls": 1,
+      "httpStatus": 202
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 36,
+      "totalMs": 36,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 47,
+      "totalMs": 47,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 52,
+      "totalMs": 52,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 57,
+      "totalMs": 57,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 58,
+      "totalMs": 58,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 73,
+      "totalMs": 73,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 83,
+      "totalMs": 83,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 86,
+      "totalMs": 86,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 96,
+      "totalMs": 96,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 65,
+      "totalMs": 65,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 68,
+      "totalMs": 68,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 76,
+      "totalMs": 76,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 142,
+      "totalMs": 142,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 66,
+      "totalMs": 66,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 99,
+      "totalMs": 99,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 115,
+      "totalMs": 115,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 147,
+      "totalMs": 147,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 126,
+      "totalMs": 126,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 67,
+      "totalMs": 67,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 107,
+      "totalMs": 107,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 170,
+      "totalMs": 170,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 159,
+      "totalMs": 159,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 72,
+      "totalMs": 72,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 120,
+      "totalMs": 120,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 125,
+      "totalMs": 125,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 174,
+      "totalMs": 174,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 81,
+      "totalMs": 81,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 76,
+      "totalMs": 76,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 96,
+      "totalMs": 96,
+      "polls": 0,
+      "httpStatus": 200
+    },
+    {
+      "requestId": 1,
+      "status": "DONE",
+      "submitMs": 105,
+      "totalMs": 105,
+      "polls": 0,
+      "httpStatus": 200
+    }
+  ]
+}

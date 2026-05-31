@@ -2,13 +2,19 @@ console.log("VeritAI content script loaded");
 const API_URL = "http://localhost:8080/api/detections";
 const FEEDBACK_URL = "http://localhost:8080/api/feedback";
 const scanCache = new Map();
-const POLL_INTERVAL_MS = 1000;
+const POLL_INITIAL_INTERVAL_MS = 1000;
+const POLL_MAX_INTERVAL_MS = 5000;
 const POLL_TIMEOUT_MS = 180000;
+const MAX_CONCURRENT_INSPECTIONS = 3;
 
 let isSystemOn = true; // 시스템 전원
 let isAutoScanMode = false; // 자동 스캔 모드
 const FACE_CROP_ANALYSIS_MODE = "face_crop_only";
 const scannedMediaKeys = new Set();
+let activeInspectionCount = 0;
+const pendingInspectionQueue = [];
+const pendingDetectionPolls = new Map();
+let batchPollingActive = false;
 
 const MAX_CACHE_SIZE = 500;
 function manageMemoryCache() {
@@ -47,6 +53,42 @@ function shouldInspectMedia(media) {
 function readDeepfakeFlag(result) {
     if (!result) return false;
     return Boolean(result.isDeepfake ?? result.deepfake);
+}
+
+function getInspectionPriority(media) {
+    if (!media || !media.isConnected) return -1;
+    const rect = media.getBoundingClientRect();
+    const viewportOverlap =
+        rect.bottom > 0 && rect.top < window.innerHeight &&
+        rect.right > 0 && rect.left < window.innerWidth;
+    const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+    return (viewportOverlap ? 1_000_000 : 0) + Math.min(area, 999_999);
+}
+
+function runWithInspectionLimit(task, media = null) {
+    return new Promise((resolve, reject) => {
+        pendingInspectionQueue.push({ task, media, resolve, reject });
+        pendingInspectionQueue.sort((a, b) => getInspectionPriority(b.media) - getInspectionPriority(a.media));
+        drainInspectionQueue();
+    });
+}
+
+function drainInspectionQueue() {
+    while (activeInspectionCount < MAX_CONCURRENT_INSPECTIONS && pendingInspectionQueue.length > 0) {
+        const next = pendingInspectionQueue.shift();
+        if (next.media && (!next.media.isConnected || !shouldInspectMedia(next.media))) {
+            next.reject(new Error("검사 대상이 화면에서 사라졌습니다."));
+            continue;
+        }
+        activeInspectionCount += 1;
+        Promise.resolve()
+            .then(next.task)
+            .then(next.resolve, next.reject)
+            .finally(() => {
+                activeInspectionCount -= 1;
+                drainInspectionQueue();
+            });
+    }
 }
 
 function updateStatusBadge(media, status, data = null) {
@@ -510,7 +552,7 @@ async function startInspection(media) {
 
     const mediaUrl = media.currentSrc || media.src;
 
-    try {
+    return runWithInspectionLimit(async () => {
         updateStatusBadge(media, "loading");
 
         if (mediaUrl && scanCache.has(mediaUrl)) {
@@ -551,7 +593,7 @@ async function startInspection(media) {
             updateStatusBadge(media, "real", data);
         }
 
-    } catch (err) {
+    }, media).catch((err) => {
         console.error("Analysis Error:", err);
         let friendlyMessage = "분석 오류";
         
@@ -579,7 +621,7 @@ async function startInspection(media) {
             delete media.dataset.veritaiAttached;
             attachUI(media);
         }, 3000);
-    }
+    });
 }
 
 const autoScanObserver = new IntersectionObserver((entries) => {
@@ -849,20 +891,92 @@ function delay(ms) {
 }
 
 async function pollDetectionResult(requestId) {
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
-        await delay(POLL_INTERVAL_MS);
-        const response = await fetch(`${API_URL}/${requestId}`);
-        if (!response.ok) throw new Error(`Server response error: ${response.status}`);
-        const data = await response.json();
-        if (data?.status === "DONE" && data.result) {
-            return data;
+    return new Promise((resolve, reject) => {
+        pendingDetectionPolls.set(String(requestId), {
+            requestId,
+            resolve,
+            reject,
+            startedAt: Date.now(),
+        });
+        ensureBatchPolling();
+    });
+}
+
+function ensureBatchPolling() {
+    if (batchPollingActive) return;
+    batchPollingActive = true;
+    runBatchPollingLoop().finally(() => {
+        batchPollingActive = false;
+        if (pendingDetectionPolls.size > 0) {
+            ensureBatchPolling();
         }
-        if (data?.status === "FAILED") {
-            throw new Error(data?.message || "Analysis failed");
+    });
+}
+
+async function runBatchPollingLoop() {
+    let delayMs = POLL_INITIAL_INTERVAL_MS;
+    while (pendingDetectionPolls.size > 0) {
+        await delay(delayMs);
+        const now = Date.now();
+        const timedOut = [];
+        pendingDetectionPolls.forEach((entry, key) => {
+            if (now - entry.startedAt >= POLL_TIMEOUT_MS) {
+                timedOut.push(key);
+            }
+        });
+        timedOut.forEach(key => {
+            const entry = pendingDetectionPolls.get(key);
+            if (entry) entry.reject(new Error("Analysis timed out."));
+            pendingDetectionPolls.delete(key);
+        });
+        if (pendingDetectionPolls.size === 0) break;
+
+        const ids = Array.from(pendingDetectionPolls.keys()).join(",");
+        let response;
+        try {
+            response = await fetch(`${API_URL}/status?ids=${encodeURIComponent(ids)}`);
+        } catch (error) {
+            pendingDetectionPolls.forEach(entry => entry.reject(error));
+            pendingDetectionPolls.clear();
+            break;
+        }
+        if (!response.ok) {
+            const error = new Error(`Server response error: ${response.status}`);
+            pendingDetectionPolls.forEach(entry => entry.reject(error));
+            pendingDetectionPolls.clear();
+            break;
+        }
+
+        const data = await response.json();
+        const items = Array.isArray(data?.items) ? data.items : [];
+        let maxRetryAfterMs = 0;
+        let completedCount = 0;
+        items.forEach(item => {
+            const key = String(item.requestId);
+            const entry = pendingDetectionPolls.get(key);
+            if (!entry) return;
+            const retryAfterMs = Number(item.retryAfterMs);
+            if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+                maxRetryAfterMs = Math.max(maxRetryAfterMs, retryAfterMs);
+            }
+            if (item.status === "DONE" && item.result) {
+                entry.resolve(item);
+                pendingDetectionPolls.delete(key);
+                completedCount += 1;
+            } else if (item.status === "FAILED") {
+                entry.reject(new Error(item?.message || "Analysis failed"));
+                pendingDetectionPolls.delete(key);
+                completedCount += 1;
+            }
+        });
+        if (completedCount > 0) {
+            delayMs = POLL_INITIAL_INTERVAL_MS;
+        } else if (maxRetryAfterMs > 0) {
+            delayMs = Math.min(POLL_MAX_INTERVAL_MS, Math.max(POLL_INITIAL_INTERVAL_MS, maxRetryAfterMs));
+        } else {
+            delayMs = Math.min(POLL_MAX_INTERVAL_MS, Math.round(delayMs * 1.25));
         }
     }
-    throw new Error("Analysis timed out.");
 }
 
 document.addEventListener('keydown', (e) => {

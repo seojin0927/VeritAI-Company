@@ -201,15 +201,15 @@ function updateStatusBadge(media, status, data = null) {
             if (e && e.type === "click") {
                 if (badge.dataset.pinned === "true") {
                     badge.dataset.pinned = "false";
-                    existingBoxes.forEach(box => box.remove()); 
+                    existingBoxes.forEach(box => { if (box.cleanupListeners) box.cleanupListeners(); box.remove(); }); 
                     return;
                 } else {
                     badge.dataset.pinned = "true";
-                    existingBoxes.forEach(box => box.remove()); 
+                    existingBoxes.forEach(box => { if (box.cleanupListeners) box.cleanupListeners(); box.remove(); }); 
                 }
             } else {
                 if (badge.dataset.pinned === "true") return; 
-                existingBoxes.forEach(box => box.remove()); 
+                existingBoxes.forEach(box => { if (box.cleanupListeners) box.cleanupListeners(); box.remove(); }); 
             }
 
             const result = data.result;
@@ -267,50 +267,40 @@ function updateStatusBadge(media, status, data = null) {
                 transition: "box-shadow 0.3s ease" 
             });
 
-            detailsBox.innerHTML = `
-<div class="veritai-drag-handle" style="color:lightskyblue; font-weight:bold; margin-bottom:10px; border-bottom:1px solid grey; padding-bottom:6px; font-size:14px; display:flex; justify-content:space-between; align-items: center; cursor: grab; user-select: none;">
-    <span>🔍 분석 리포트 ${badge.dataset.pinned === "true" ? "📌" : ""}</span>
-    <span class="veritai-close-btn" style="cursor:pointer; color:gray; padding: 0 5px; font-size: 16px;">✕</span>
-</div>
-<b>ID:</b> ${data.requestId || 'N/A'}<br>
-<b>판정:</b> ${readDeepfakeFlag(result) ? "<span style='color:crimson; font-weight:bold;'>조작 의심</span>" : "<span style='color:lightgreen; font-weight:bold;'>정상</span>"}<br>
-<b>딥페이크 분석률:</b>
-<div style="margin: 8px 0;">
-    <div style="display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 4px;">
-        <span>AI 조작 신뢰도</span>
-        <span style="font-weight: bold; color: ${status === 'fake' ? '#ef4444' : '#10b981'};">
-            ${((result.confidence || 0) * 100).toFixed(1)}%
-        </span>
-    </div>
-    <div style="width: 100%; height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; overflow: hidden;">
-        <div style="
-            width: ${Math.max(((result.confidence || 0) * 100), 2)}%; /* 최소 2%는 보이게 처리 */
-            height: 100%; 
-            background: ${status === 'fake' ? 'linear-gradient(90deg, #f87171, #ef4444)' : 'linear-gradient(90deg, #34d399, #10b981)'};
-            transition: width 0.2s ease-out;
-        "></div>
-    </div>
-</div>
-<b>시간:</b> ${result.processingTimeMs || 0}ms<br>
-<b>얼굴 수:</b> ${result.faceCount || faces.length}명<br>
-<div style="margin:10px 0; border-top:1px dashed grey;"></div>
-${faceText}
+            const isFake = status === "fake";
+            const rawConf = result.confidence || 0;
+            const displayScore = isFake ? (rawConf * 100) : ((1 - rawConf) * 100);
+            const scoreLabel = isFake ? "조작 의심 확률" : "원본 일치율";
+            const scoreColor = isFake ? "#ef4444" : "#10b981";
+            const barGradient = isFake ? "linear-gradient(90deg, #f87171, #ef4444)" : "linear-gradient(90deg, #34d399, #10b981)";
 
+            detailsBox.innerHTML = `
+<div class="veritai-drag-handle" style="color:lightskyblue; font-weight:bold; margin-bottom:12px; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:8px; font-size:14px; display:flex; justify-content:space-between; align-items: center; cursor: grab; user-select: none;">
+    <span>🔍 분석 리포트 ${badge.dataset.pinned === "true" ? "📌" : ""}</span>
+    <span class="veritai-close-btn" style="cursor:pointer; color:#94a3b8; padding: 0 5px; font-size: 16px;">✕</span>
+</div>
+<div style="display: flex; flex-direction: column; gap: 6px;">
+    <div><b>ID:</b> <span style="color:#e2e8f0;">${data.requestId || 'N/A'}</span></div>
+    <div><b>판정:</b> ${readDeepfakeFlag(result) ? "<span style='color:#ef4444; font-weight:bold;'>조작 의심</span>" : "<span style='color:#10b981; font-weight:bold;'>정상</span>"}</div>
+    <div style="margin-top: 4px;">
+        <b>상세 분석률:</b>
+        <div style="display: flex; justify-content: space-between; font-size: 11px; margin: 4px 0;">
+            <span>${scoreLabel}</span>
+            <span style="font-weight: bold; color: ${scoreColor};">
+                ${displayScore.toFixed(1)}%
+            </span>
+        </div>
+        <div style="width: 100%; height: 6px; background: rgba(0,0,0,0.3); border-radius: 3px; overflow: hidden; border: 1px solid rgba(255,255,255,0.05);">
+            <div style="width: ${Math.max(displayScore, 2)}%; height: 100%; background: ${barGradient}; transition: width 0.2s ease-out;"></div>
+        </div>
+    </div>
+    <div style="margin-top: 4px;"><b>시간:</b> <span style="color:#e2e8f0;">${result.processingTimeMs || 0}ms</span></div>
+    <div><b>얼굴 수:</b> <span style="color:#e2e8f0;">${result.faceCount || faces.length}명</span></div>
+</div>
+<div style="margin:12px 0; border-top:1px dashed rgba(255,255,255,0.2);"></div>
+${faceText}
 <div style="margin-top: 15px; display: flex; justify-content: flex-end;">
-    <button class="veritai-feedback-btn" style="
-        background: rgba(255, 60, 60, 0.1); 
-        border: 1px solid rgba(255, 60, 60, 0.3); 
-        color: #ff6b6b; 
-        border-radius: 20px; 
-        cursor: pointer; 
-        font-size: 11px; 
-        font-weight: bold; 
-        width: 90px !important; 
-        height: 30px; 
-        display: flex; 
-        align-items: center; 
-        justify-content: center;
-    ">🚨 오답 신고</button>
+    <button class="veritai-feedback-btn" style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); color: #f87171; border-radius: 20px; cursor: pointer; font-size: 11px; font-weight: bold; width: 80px !important; height: 28px; display: flex; align-items: center; justify-content: center; transition: all 0.2s;">🚨 오답 신고</button>
 </div>
             `.trim();
 
@@ -353,20 +343,23 @@ ${faceText}
                 e.preventDefault();
             });
 
-            document.addEventListener('mousemove', (e) => {
+            const onMouseMove = (e) => {
                 if (!isDragging) return;
                 const dx = e.clientX - startX;
                 const dy = e.clientY - startY;
                 detailsBox.style.left = (initialLeft + dx) + 'px';
                 detailsBox.style.top = (initialTop + dy) + 'px';
-            });
+            };
 
-            document.addEventListener('mouseup', () => {
+            const onMouseUp = () => {
                 if (isDragging) {
                     isDragging = false;
                     dragHandle.style.cursor = 'grab';
                 }
-            });
+            };
+
+            window.addEventListener('mousemove', onMouseMove);
+            window.addEventListener('mouseup', onMouseUp);
 
             const updatePosition = () => {
                 if (!document.body.contains(detailsBox)) return; 
@@ -398,6 +391,8 @@ ${faceText}
             let closeDetails; 
             detailsBox.cleanupListeners = () => {
                 window.removeEventListener('resize', updatePosition);
+                window.removeEventListener('mousemove', onMouseMove); 
+                window.removeEventListener('mouseup', onMouseUp);
                 if (closeDetails) document.removeEventListener('click', closeDetails);
             };
 
@@ -409,17 +404,6 @@ ${faceText}
                     badge.dataset.pinned = "false"; 
                     detailsBox.cleanupListeners(); 
                     detailsBox.remove();
-                });
-            }
-
-            const closeBtn = detailsBox.querySelector('.veritai-close-btn');
-            if (closeBtn) {
-                closeBtn.addEventListener('click', (evt) => {
-                    evt.preventDefault();
-                    evt.stopImmediatePropagation();
-                    badge.dataset.pinned = "false"; 
-                    detailsBox.remove();
-                    window.removeEventListener('resize', updatePosition);
                 });
             }
 
@@ -759,7 +743,10 @@ function clearAllUI() {
     });
     scannedMediaKeys.clear();
 
-    document.querySelectorAll('.veritai-details-box').forEach(box => box.remove());
+    document.querySelectorAll('.veritai-details-box').forEach(box => {
+        if (box.cleanupListeners) box.cleanupListeners();
+        box.remove();
+    });
 }
 
 chrome.storage.local.get(['isSystemOn', 'isAutoScanOn'], (result) => {
@@ -855,10 +842,17 @@ async function sendToBackend(blob, mediaType, analysisMode = FACE_CROP_ANALYSIS_
         }
         
         const data = await response.json();
-        if (!data || data.status !== "DONE" || !data.result) {
-            throw new Error(data?.message || "분석이 정상적으로 완료되지 않았습니다.");
+        if (!data) throw new Error("분석이 정상적으로 완료되지 않았습니다.");
+        
+        if (data.status === "DONE" && data.result) return data;
+        
+        if ((data.status === "PROCESSING" || data.status === "QUEUED") && data.requestId) {
+            return await pollDetectionResult(data.requestId);
         }
-        return data;
+        
+        if (data.status === "FAILED") throw new Error(data?.message || "Analysis failed");
+        
+        throw new Error(data?.message || "분석이 정상적으로 완료되지 않았습니다.");
 
     } catch (err) {
         clearTimeout(timeoutId);
@@ -869,21 +863,6 @@ async function sendToBackend(blob, mediaType, analysisMode = FACE_CROP_ANALYSIS_
         }
         throw err;
     }
-
-    const response = await fetch(API_URL, {
-        method: "POST",
-        body: formData,
-    });
-
-    if (!response.ok) throw new Error(`Server response error: ${response.status}`);
-    const data = await response.json();
-    if (!data) throw new Error("Analysis did not finish normally.");
-    if (data.status === "DONE" && data.result) return data;
-    if ((data.status === "PROCESSING" || data.status === "QUEUED") && data.requestId) {
-        return pollDetectionResult(data.requestId);
-    }
-    if (data.status === "FAILED") throw new Error(data?.message || "Analysis failed");
-    throw new Error(data?.message || "Analysis did not finish normally.");
 }
 
 function delay(ms) {
@@ -982,6 +961,9 @@ async function runBatchPollingLoop() {
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
         const detailsBox = document.querySelector('.veritai-details-box');
-        if (detailsBox) detailsBox.remove();
+        if (detailsBox) {
+            if (detailsBox.cleanupListeners) detailsBox.cleanupListeners();
+            detailsBox.remove();
+        }
     }
 });

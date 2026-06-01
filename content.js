@@ -128,13 +128,16 @@ function updateStatusBadge(media, status, data = null) {
     badge.onclick = null;
     badge.onmouseenter = null;
     badge.onmouseleave = null;
-    badge.dataset.pinned = "false"; 
-    
+    badge.dataset.pinned = "false";
+
     badge.style.cssText = `
         padding: 4px 8px; border-radius: 4px; color: white; font-size: 11px; 
         font-weight: bold; font-family: sans-serif; box-shadow: 0 2px 4px rgba(0,0,0,0.5);
         transition: all 0.2s ease; user-select: none; cursor: default;
-        pointer-events: auto; 
+        pointer-events: auto !important;
+
+        box-sizing: border-box !important;
+        line-height: normal !important;
     `;
     media.style.border = "none";
 
@@ -190,7 +193,7 @@ function updateStatusBadge(media, status, data = null) {
         }
 
         const showReportBox = (e) => {
-            if(e) {
+            if (e) {
                 e.preventDefault();
                 e.stopPropagation();
             }
@@ -201,28 +204,28 @@ function updateStatusBadge(media, status, data = null) {
             if (e && e.type === "click") {
                 if (badge.dataset.pinned === "true") {
                     badge.dataset.pinned = "false";
-                    existingBoxes.forEach(box => { if (box.cleanupListeners) box.cleanupListeners(); box.remove(); }); 
+                    existingBoxes.forEach(box => { if (box.cleanupListeners) box.cleanupListeners(); box.remove(); });
                     return;
                 } else {
                     badge.dataset.pinned = "true";
-                    existingBoxes.forEach(box => { if (box.cleanupListeners) box.cleanupListeners(); box.remove(); }); 
+                    existingBoxes.forEach(box => { if (box.cleanupListeners) box.cleanupListeners(); box.remove(); });
                 }
             } else {
-                if (badge.dataset.pinned === "true") return; 
-                existingBoxes.forEach(box => { if (box.cleanupListeners) box.cleanupListeners(); box.remove(); }); 
+                if (badge.dataset.pinned === "true") return;
+                existingBoxes.forEach(box => { if (box.cleanupListeners) box.cleanupListeners(); box.remove(); });
             }
 
             const result = data.result;
             const faces = result.faces || [];
 
-            const faceText = faces.length === 0 ? 
+            const faceText = faces.length === 0 ?
                 "<div style='text-align:center; color:#94a3b8; padding: 10px 0;'>검출된 얼굴 없음</div>" :
                 faces.slice(0, 3).map((f, i) => {
                     const bbox = f.bbox || {};
                     const quality = f.quality || {};
                     const detConf = ((f.detectionConfidence || f.score || 0) * 100).toFixed(1);
                     const qualScore = ((quality.score || 0) * 100).toFixed(1);
-                    
+
                     return `
                     <div style="background: rgba(0, 0, 0, 0.2); padding: 8px 10px; border-radius: 6px; margin-bottom: 8px; border: 1px solid rgba(255,255,255,0.05);">
                         <div style="color:#fbbf24; font-weight:bold; margin-bottom: 6px; font-size: 11.5px;">[얼굴 ${i + 1}]</div>
@@ -241,9 +244,9 @@ function updateStatusBadge(media, status, data = null) {
 
             Object.assign(detailsBox.style, {
                 position: "absolute",
-                top: "0px",  
-                left: "0px", 
-                willChange: "transform", 
+                top: "0px",
+                left: "0px",
+                willChange: "transform",
                 zIndex: "2147483647",
                 background: "rgba(30, 41, 59, 0.95)",
                 backdropFilter: "blur(12px)",
@@ -254,7 +257,7 @@ function updateStatusBadge(media, status, data = null) {
                 fontSize: "12px",
                 whiteSpace: "normal",
                 lineHeight: "1.6",
-                boxShadow: badge.dataset.pinned === "true" 
+                boxShadow: badge.dataset.pinned === "true"
                     ? `0 0 15px ${status === "fake" ? "rgba(239, 68, 68, 0.4)" : "rgba(16, 185, 129, 0.4)"}`
                     : "0 10px 25px -5px rgba(0, 0, 0, 0.5)",
                 fontFamily: "monospace",
@@ -264,7 +267,12 @@ function updateStatusBadge(media, status, data = null) {
                 textAlign: "left",
                 cursor: "default",
                 pointerEvents: "auto",
-                transition: "box-shadow 0.3s ease" 
+                transition: "box-shadow 0.3s ease",
+
+                boxSizing: "border-box",
+                fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+                margin: "0",
+                letterSpacing: "normal"
             });
 
             const isFake = status === "fake";
@@ -306,15 +314,15 @@ ${faceText}
 
             detailsBox.onclick = (evt) => evt.stopPropagation();
             detailsBox.onmouseenter = () => { detailsBox.dataset.isHovered = "true"; };
-            detailsBox.onmouseleave = () => { 
-                detailsBox.dataset.isHovered = "false"; 
+            detailsBox.onmouseleave = () => {
+                detailsBox.dataset.isHovered = "false";
                 if (status === "real" && badge.dataset.pinned !== "true") {
                     setTimeout(() => {
                         if (detailsBox.dataset.isHovered !== "true" && badge.dataset.isHovered !== "true") {
                             badge.dataset.pinned = "false";
                             detailsBox.remove();
                         }
-                    }, 400); 
+                    }, 400);
                 }
             };
 
@@ -325,11 +333,11 @@ ${faceText}
             let startX, startY, initialLeft, initialTop;
 
             dragHandle.addEventListener('mousedown', (e) => {
-                if (e.target.classList.contains('veritai-close-btn')) return; 
+                if (e.target.classList.contains('veritai-close-btn')) return;
                 isDragging = true;
-                detailsBox.dataset.isDragged = "true"; 
+                detailsBox.dataset.isDragged = "true";
                 dragHandle.style.cursor = 'grabbing';
-                
+
                 const rect = detailsBox.getBoundingClientRect();
                 detailsBox.style.transform = 'none';
                 detailsBox.style.left = (rect.left + window.scrollX) + 'px';
@@ -339,7 +347,7 @@ ${faceText}
                 startY = e.clientY;
                 initialLeft = parseFloat(detailsBox.style.left) || 0;
                 initialTop = parseFloat(detailsBox.style.top) || 0;
-                
+
                 e.preventDefault();
             });
 
@@ -362,9 +370,9 @@ ${faceText}
             window.addEventListener('mouseup', onMouseUp);
 
             const updatePosition = () => {
-                if (!document.body.contains(detailsBox)) return; 
+                if (!document.body.contains(detailsBox)) return;
                 if (detailsBox.dataset.isDragged === "true") return;
-                
+
                 const badgeRect = badge.getBoundingClientRect();
                 const boxWidth = 280;
                 const boxMaxHeight = 400;
@@ -384,14 +392,14 @@ ${faceText}
 
                 detailsBox.style.transform = `translate3d(${leftPos}px, ${topPos}px, 0)`;
             };
-            
+
             updatePosition();
             window.addEventListener('resize', updatePosition);
 
-            let closeDetails; 
+            let closeDetails;
             detailsBox.cleanupListeners = () => {
                 window.removeEventListener('resize', updatePosition);
-                window.removeEventListener('mousemove', onMouseMove); 
+                window.removeEventListener('mousemove', onMouseMove);
                 window.removeEventListener('mouseup', onMouseUp);
                 if (closeDetails) document.removeEventListener('click', closeDetails);
             };
@@ -401,8 +409,8 @@ ${faceText}
                 closeBtn.addEventListener('click', (evt) => {
                     evt.preventDefault();
                     evt.stopImmediatePropagation();
-                    badge.dataset.pinned = "false"; 
-                    detailsBox.cleanupListeners(); 
+                    badge.dataset.pinned = "false";
+                    detailsBox.cleanupListeners();
                     detailsBox.remove();
                 });
             }
@@ -426,7 +434,7 @@ ${faceText}
                     const reasonInput = document.createElement('textarea');
                     reasonInput.placeholder = "어떤 부분이 잘못되었나요?";
                     reasonInput.style.cssText = `font-size: 11px; padding: 5px; border-radius: 4px; border: 1px solid #555; background: #222; color: white; resize: none; height: 40px; font-family: sans-serif;`;
-                    
+
                     const actionContainer = document.createElement('div');
                     actionContainer.style.cssText = 'display: flex; justify-content: flex-end; gap: 5px;';
                     const cancelBtn = document.createElement('button');
@@ -501,7 +509,7 @@ ${faceText}
                 badge.dataset.isHovered = "true";
                 showReportBox(e);
             };
-            
+
             badge.onmouseleave = () => {
                 badge.dataset.isHovered = "false";
                 if (badge.dataset.pinned !== "true") {
@@ -512,7 +520,7 @@ ${faceText}
                             if (existingBox.cleanupListeners) existingBox.cleanupListeners();
                             existingBox.remove();
                         }
-                    }, 400); 
+                    }, 400);
                 }
             };
         }
@@ -521,8 +529,21 @@ ${faceText}
 async function startInspection(media) {
     if (!isSystemOn || !shouldInspectMedia(media)) return;
 
+    if (media.dataset.veritaiScanned === "true") return;
+
+    const mediaUrl = media.currentSrc || media.src;
     const scanKey = getMediaKey(media);
-    if (media.dataset.veritaiScanned === "true" || scannedMediaKeys.has(scanKey)) return;
+
+    if (mediaUrl && scanCache.has(mediaUrl)) {
+        media.dataset.veritaiScanned = "true";
+        media.dataset.veritaiScanKey = scanKey;
+        scannedMediaKeys.add(scanKey); 
+        const cachedData = scanCache.get(mediaUrl);
+        updateStatusBadge(media, readDeepfakeFlag(cachedData.result) ? "fake" : "real", cachedData);
+        return;
+    }
+
+    if (scannedMediaKeys.has(scanKey)) return;
     scannedMediaKeys.add(scanKey);
     manageMemoryCache();
     media.dataset.veritaiScanned = "true";
@@ -533,8 +554,6 @@ async function startInspection(media) {
         const btn = wrapper.querySelector('.veritai-check-btn');
         if (btn) btn.remove();
     }
-
-    const mediaUrl = media.currentSrc || media.src;
 
     return runWithInspectionLimit(async () => {
         updateStatusBadge(media, "loading");
@@ -564,7 +583,7 @@ async function startInspection(media) {
 
         if (!media.dataset.veritaiScanned) {
             console.log("검사 중지됨: 로딩 중 모드가 해제되었습니다.");
-            return; 
+            return;
         }
 
         if (mediaUrl) {
@@ -580,11 +599,11 @@ async function startInspection(media) {
     }, media).catch((err) => {
         console.error("Analysis Error:", err);
         let friendlyMessage = "분석 오류";
-        
+
         if (err.status === 429) {
             friendlyMessage = "요청 과다 (잠시 후 시도)";
         } else if (err.status === 408) {
-            friendlyMessage = "응답 지연 (서버 혼잡)"; 
+            friendlyMessage = "응답 지연 (서버 혼잡)";
         } else if (err.status >= 500) {
             friendlyMessage = "서버 내부 오류";
         } else if (err.name === 'TypeError' && err.message === 'Failed to fetch') {
@@ -612,8 +631,8 @@ const autoScanObserver = new IntersectionObserver((entries) => {
     if (!isSystemOn || !isAutoScanMode) return;
     entries.forEach(entry => {
         if (entry.isIntersecting && entry.target.clientWidth > 80) {
-            if(entry.target.dataset.scanTimer) clearTimeout(entry.target.dataset.scanTimer);
-            
+            if (entry.target.dataset.scanTimer) clearTimeout(entry.target.dataset.scanTimer);
+
             entry.target.dataset.scanTimer = setTimeout(() => {
                 const rect = entry.target.getBoundingClientRect();
                 if (rect.top < window.innerHeight && rect.bottom > 0) {
@@ -630,29 +649,50 @@ let debounceTimer;
 const domObserver = new MutationObserver((mutations) => {
     if (!isSystemOn) return;
 
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-        mutations.forEach(mutation => {
+    mutations.forEach(mutation => {
+        
+        if (mutation.addedNodes) {
             mutation.addedNodes.forEach(node => {
                 if (node.nodeType === 1 && (node.tagName === 'IMG' || node.tagName === 'VIDEO')) {
-                    if (!node.dataset.veritaiAttached) attachUI(node);
+                    attachUI(node); 
                 }
                 else if (node.nodeType === 1 && node.querySelectorAll) {
-                    node.querySelectorAll('img, video').forEach(media => {
-                        if (!media.dataset.veritaiAttached) attachUI(media);
-                    });
+                    node.querySelectorAll('img, video').forEach(media => attachUI(media));
                 }
             });
-        });
-    }, 300);
+        }
+        
+        if (mutation.type === 'attributes' && (mutation.attributeName === 'src' || mutation.attributeName === 'srcset')) {
+            const target = mutation.target;
+            if (target.tagName === 'IMG' || target.tagName === 'VIDEO') {
+                delete target.dataset.veritaiAttached;
+                delete target.dataset.veritaiScanned;
+                delete target.dataset.veritaiScanKey;
+                const wrapper = ensureWrapper(target);
+                if (wrapper) {
+                    const oldBadge = wrapper.querySelector('.veritai-ui-container');
+                    if (oldBadge) oldBadge.remove();
+                    const oldBtn = wrapper.querySelector('.veritai-check-btn');
+                    if (oldBtn) oldBtn.remove();
+                }
+                
+                if (target.tagName === 'IMG' && !target.complete) {
+                    target.addEventListener('load', () => attachUI(target), { once: true });
+                } else {
+                    attachUI(target); 
+                }
+            }
+        }
+    });
 });
 
 function ensureWrapper(media) {
     let parent = media.parentElement;
     if (!parent) return null;
 
-    if (parent.tagName === 'PICTURE') {
+    if (parent.tagName === 'PICTURE' || parent.tagName === 'YT-IMAGE' || parent.tagName === 'YT-IMG-SHADOW') {
         parent = parent.parentElement;
+        if (!parent) return null;
     }
 
     if (getComputedStyle(parent).position === "static") {
@@ -661,24 +701,40 @@ function ensureWrapper(media) {
     return parent;
 }
 
-function attachUI(media) {
+function attachUI(media, retryCount = 0) {
     if (media.tagName === 'IMG' && !media.complete) {
-        media.addEventListener('load', () => attachUI(media), { once: true });
+        media.addEventListener('load', () => attachUI(media, retryCount), { once: true });
         return;
     }
 
-    if (!shouldInspectMedia(media)) return;
+    if (!shouldInspectMedia(media)) {
+        if (retryCount < 5) {
+            setTimeout(() => attachUI(media, retryCount + 1), 300);
+        }
+        return;
+    }
 
     const wrapper = ensureWrapper(media);
     const hasUI = wrapper && (wrapper.querySelector('.veritai-check-btn') || wrapper.querySelector('.veritai-status-badge'));
+
+    const mediaUrl = media.currentSrc || media.src;
+
+    if (mediaUrl && scanCache.has(mediaUrl) && !hasUI) {
+        media.dataset.veritaiAttached = "true";
+        media.dataset.veritaiScanned = "true";
+        media.dataset.veritaiScanKey = getMediaKey(media);
+        const data = scanCache.get(mediaUrl);
+        updateStatusBadge(media, readDeepfakeFlag(data.result) ? "fake" : "real", data);
+        return;
+    }
 
     if (media.dataset.veritaiAttached === "true" && hasUI) return;
 
     media.dataset.veritaiAttached = "true";
     delete media.dataset.veritaiScanned;
 
-    if (isAutoScanMode) {
-        autoScanObserver.observe(media);
+    if (isAutoScanMode && media.tagName !== 'VIDEO') {
+        autoScanObserver.observe(media); // 이미지만 자동 스캔
     } else {
         if (wrapper && !wrapper.querySelector('.veritai-check-btn')) {
             const btn = document.createElement("button");
@@ -691,7 +747,7 @@ function attachUI(media) {
                 left: 8px; 
                 z-index: 2147483647;
                 padding: 4px 10px; 
-                background-color: rgba(59, 130, 246, 0.9); /* 세련된 블루 */
+                background-color: rgba(59, 130, 246, 0.9);
                 color: #ffffff;
                 border: 1px solid rgba(255, 255, 255, 0.2); 
                 border-radius: 6px;
@@ -699,6 +755,11 @@ function attachUI(media) {
                 font-weight: 600; font-size: 11px; backdrop-filter: blur(4px);
                 transition: all 0.2s ease;
                 box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+                pointer-events: auto !important;
+
+                box-sizing: border-box !important;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+                line-height: normal !important;
             `;
             btn.onmouseenter = () => btn.style.backgroundColor = "rgba(37, 99, 235, 1)";
             btn.onmouseleave = () => btn.style.backgroundColor = "rgba(59, 130, 246, 0.9)";
@@ -722,7 +783,7 @@ chrome.runtime.onMessage.addListener((msg) => {
         clearAllUI();
         if (isSystemOn) {
             document.querySelectorAll('img, video').forEach(media => attachUI(media));
-            domObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "style", "open", "aria-hidden", "aria-modal"] });
+            domObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "class", "style", "open", "aria-hidden", "aria-modal"] });
         }
     }
 });
@@ -755,7 +816,7 @@ chrome.storage.local.get(['isSystemOn', 'isAutoScanOn'], (result) => {
     setTimeout(() => {
         if (isSystemOn) {
             document.querySelectorAll('img, video').forEach(media => attachUI(media));
-            domObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "style", "open", "aria-hidden", "aria-modal"] });
+            domObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: [ "src","class", "style", "open", "aria-hidden", "aria-modal"] });
         }
     }, 500);
 });
@@ -830,35 +891,35 @@ async function sendToBackend(blob, mediaType, analysisMode = FACE_CROP_ANALYSIS_
         const response = await fetch(API_URL, {
             method: "POST",
             body: formData,
-            signal: controller.signal 
+            signal: controller.signal
         });
 
-        clearTimeout(timeoutId); 
+        clearTimeout(timeoutId);
 
         if (!response.ok) {
             const error = new Error(`Server Error`);
-            error.status = response.status; 
+            error.status = response.status;
             throw error;
         }
-        
+
         const data = await response.json();
         if (!data) throw new Error("분석이 정상적으로 완료되지 않았습니다.");
-        
+
         if (data.status === "DONE" && data.result) return data;
-        
+
         if ((data.status === "PROCESSING" || data.status === "QUEUED") && data.requestId) {
             return await pollDetectionResult(data.requestId);
         }
-        
+
         if (data.status === "FAILED") throw new Error(data?.message || "Analysis failed");
-        
+
         throw new Error(data?.message || "분석이 정상적으로 완료되지 않았습니다.");
 
     } catch (err) {
         clearTimeout(timeoutId);
         if (err.name === 'AbortError') {
             const timeoutErr = new Error("Timeout");
-            timeoutErr.status = 408; 
+            timeoutErr.status = 408;
             throw timeoutErr;
         }
         throw err;
@@ -967,3 +1028,27 @@ document.addEventListener('keydown', (e) => {
         }
     }
 });
+
+document.addEventListener('click', (e) => {
+    if (!e.isTrusted) return; 
+
+    const customUIs = document.querySelectorAll('.veritai-check-btn, .veritai-status-badge');
+    if (customUIs.length === 0) return; 
+
+    for (let ui of customUIs) {
+        const rect = ui.getBoundingClientRect();
+        if (e.clientX >= rect.left && e.clientX <= rect.right &&
+            e.clientY >= rect.top && e.clientY <= rect.bottom) {
+            
+            e.preventDefault();
+            e.stopPropagation();
+            
+            if (ui.classList.contains('veritai-check-btn')) {
+                ui.click();
+            } else if (ui.classList.contains('veritai-status-badge') && ui.onclick) {
+                ui.onclick(e);
+            }
+            return; 
+        }
+    }
+}, true);

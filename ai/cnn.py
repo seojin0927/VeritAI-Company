@@ -168,6 +168,11 @@ class CnnRuntime:
             model.load_state_dict(payload, strict=True)
             model.eval()
             self.model = model
+            
+            self.features_output = None
+            def hook_fn(module, input, output):
+                self.features_output = output.detach() # 화면 캡처 저장           
+            self.model.model.features.register_forward_hook(hook_fn) 
             self.load_error = None
         except Exception as exc:
             self.model = None
@@ -200,18 +205,32 @@ class CnnRuntime:
         batch = torch.stack([self._tensor_from_bgr(view.bgr) for view in valid_views]).to(self.device)
         logits = self.model(batch)
         probs = torch.softmax(logits, dim=1)[:, FAKE_CLASS_INDEX].detach().cpu().numpy()
+        
+        try:
+            fc_weights = self.model.model.classifier[1].weight[FAKE_CLASS_INDEX]
+            cam_batch = torch.relu(torch.einsum('bchw,c->bhw', self.features_output, fc_weights))
+        except Exception:
+            cam_batch = None
+
         view_results = []
         best_prob = 0.0
-        for view, prob in zip(valid_views, probs):
+        best_heatmap = None
+
+        for idx, (view, prob) in enumerate(zip(valid_views, probs)):
             fake_prob = float(prob)
+            is_best = fake_prob > best_prob
             best_prob = max(best_prob, fake_prob)
-            view_results.append(
-                {
-                    "name": view.name,
-                    "fakeProbability": round(fake_prob, 6),
-                    "bbox": view.bbox,
-                }
-            )
+            
+            if is_best and cam_batch is not None:
+                cam = cam_batch[idx].cpu().numpy()
+                cam = np.uint8(255 * (cam - np.min(cam)) / (np.max(cam) - np.min(cam) + 1e-8)) 
+                h, w = view.bgr.shape[:2]
+                cam_resized = cv2.resize(cam, (w, h)) 
+                best_heatmap = cv2.applyColorMap(cam_resized, cv2.COLORMAP_JET) 
+
+            view_results.append({
+                "name": view.name, "fakeProbability": round(fake_prob, 6), "bbox": view.bbox
+            })
         return {
             "modelLoaded": True,
             "checkpoint": str(self.checkpoint_path),
@@ -219,6 +238,7 @@ class CnnRuntime:
             "isDeepfake": bool(best_prob >= self.threshold),
             "threshold": self.threshold,
             "views": view_results,
+            "heatmap_array": best_heatmap,
         }
 
     def predict_image_faces(self, bgr: np.ndarray, faces: Sequence[Dict[str, Any]]) -> Dict[str, Any]:

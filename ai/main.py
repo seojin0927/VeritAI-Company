@@ -168,6 +168,7 @@ def run_cnn_prediction(image, faces):
             "fakeProbability": 0.0,
             "isDeepfake": False,
             "views": [],
+            "heatmapBase64": None,
         }
 
     view_by_name = {view.get("name"): view for view in result.get("views", [])}
@@ -4836,7 +4837,7 @@ async def predict(file: UploadFile = File(...), analysisMode: str = Form("full_i
         save_debug_metadata(request_uid, faces, debug_paths)
     debug_time_ms = int((time.time() - debug_started) * 1000)
     cnn_started = time.time()
-    cnn_result = run_cnn_prediction(img, faces)
+    cnn_result = run_cnn_prediction(img, faces) 
     cnn_time_ms = int((time.time() - cnn_started) * 1000)
     processing_time_ms = int((time.time() - start) * 1000)
     ready_faces = [face for face in faces if face["quality"]["label"] != "poor"]
@@ -4859,6 +4860,34 @@ async def predict(file: UploadFile = File(...), analysisMode: str = Form("full_i
     if not cnn_loaded and cnn_error:
         message += f" cnnError={cnn_error}"
     debug_images = {key: normalize_path(path) for key, path in debug_paths.items()} if DEBUG_ARTIFACTS else {}
+    
+    heatmap_base64 = None
+    try:
+        import cv2
+        import base64
+        import numpy as np
+        
+        heatmap = cnn_result.get("heatmap_array")
+        
+        if heatmap is not None:
+            # 히트맵 크기 축소
+            h, w = heatmap.shape[:2]
+            new_w = 500
+            new_h = int((new_w / w) * h)
+            heatmap_resized = cv2.resize(heatmap, (new_w, new_h))
+            
+            # JPG로 압축 후 Base64 텍스트로 변환
+            _, buffer = cv2.imencode('.jpg', heatmap_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+            heatmap_base64 = base64.b64encode(buffer).decode('utf-8')
+        else:
+            print("CNN결과에 히트맵 데이터가 없습니다. (얼굴 미검출 등)")
+            
+    except Exception as e:
+        print(f"Heatmap generation failed: {e}")
+
+    if "heatmap_array" in cnn_result:
+        del cnn_result["heatmap_array"]
+
     return {
         "isDeepfake": is_deepfake,
         "confidence": confidence,
@@ -4873,8 +4902,8 @@ async def predict(file: UploadFile = File(...), analysisMode: str = Form("full_i
         "faces": faces,
         "cnn": cnn_result,
         "debugImages": debug_images,
+        "heatmapBase64": heatmap_base64,
     }
-
 
 @app.get("/")
 async def root():

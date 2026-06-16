@@ -22,6 +22,7 @@ public class AiPredictionDto {
     private List<Map<String, Object>> faces;
     private Map<String, Object> cnn;
     private Map<String, String> debugImages;
+    private String heatmapBase64;
 
     @JsonProperty("isDeepfake")
     public boolean isDeepfake() {
@@ -127,5 +128,13 @@ public class AiPredictionDto {
 
     public void setDebugImages(Map<String, String> debugImages) {
         this.debugImages = debugImages;
+    }
+
+    public String getHeatmapBase64() {
+        return heatmapBase64;
+    }
+
+    public void setHeatmapBase64(String heatmapBase64) {
+        this.heatmapBase64 = heatmapBase64;
     }
 }

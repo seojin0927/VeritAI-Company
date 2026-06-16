@@ -2,13 +2,13 @@ console.log("VeritAI content script loaded");
 const API_URL = "http://localhost:8080/api/detections";
 const FEEDBACK_URL = "http://localhost:8080/api/feedback";
 const scanCache = new Map();
-const POLL_INITIAL_INTERVAL_MS = 1000;
-const POLL_MAX_INTERVAL_MS = 5000;
+const POLL_INITIAL_INTERVAL_MS = 300;
+const POLL_MAX_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS = 180000;
-const MAX_CONCURRENT_INSPECTIONS = 3;
+const MAX_CONCURRENT_INSPECTIONS = (navigator.hardwareConcurrency || 4) <= 4 ? 2 : 3;
 
-let isSystemOn = true; // 시스템 전원
-let isAutoScanMode = false; // 자동 스캔 모드
+let isSystemOn = true;
+let isAutoScanMode = false;
 const FACE_CROP_ANALYSIS_MODE = "face_crop_only";
 const scannedMediaKeys = new Set();
 let activeInspectionCount = 0;
@@ -47,6 +47,9 @@ function isVisibleMedia(media) {
 }
 
 function shouldInspectMedia(media) {
+    if (media.closest('.veritai-details-box') || media.closest('.veritai-ui-container')) {
+        return false;
+    }
     return isVisibleMedia(media);
 }
 
@@ -88,6 +91,116 @@ function drainInspectionQueue() {
                 activeInspectionCount -= 1;
                 drainInspectionQueue();
             });
+    }
+}
+
+async function captureImageBlob(imageUrl) {
+    if (!imageUrl) throw new Error("이미지 주소가 없습니다.");
+    
+    return new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage({
+            action: "resize_image",
+            url: imageUrl
+        }, async (response) => {
+            if (chrome.runtime.lastError) {
+                return reject(new Error(chrome.runtime.lastError.message));
+            }
+            if (response && response.success && response.base64) {
+                try {
+                    const res = await fetch(response.base64);
+                    const blob = await res.blob();
+                    resolve(blob);
+                } catch (e) {
+                    reject(new Error("이미지 변환 실패"));
+                }
+            } else {
+                reject(new Error(response?.error || "리사이징 실패"));
+            }
+        });
+    });
+}
+
+async function captureVideoBlob(video) {
+    if (!video) throw new Error("영상 요소를 찾을 수 없습니다.");
+    let width = video.videoWidth || video.clientWidth;
+    let height = video.videoHeight || video.clientHeight;
+    if (width === 0 || height === 0) throw new Error("영상 크기를 인식할 수 없습니다.");
+
+    return new Promise((resolve, reject) => {
+        try {
+            const canvas = document.createElement("canvas");
+            const ctx = canvas.getContext("2d");
+            if (!ctx) return reject(new Error("캔버스 컨텍스트를 생성하지 못했습니다."));
+
+            const MAX_SIZE = 1280;
+            if (width > MAX_SIZE || height > MAX_SIZE) {
+                const ratio = Math.min(MAX_SIZE / width, MAX_SIZE / height);
+                width = Math.round(width * ratio);
+                height = Math.round(height * ratio);
+            }
+            canvas.width = width;
+            canvas.height = height;
+
+            if (!video.crossOrigin) { video.crossOrigin = "anonymous"; }
+            
+            ctx.drawImage(video, 0, 0, width, height);
+            canvas.toBlob((blob) => {
+                if (!blob) return reject(new Error("영상 프레임 데이터를 생성하지 못했습니다."));
+                resolve(blob);
+            }, "image/webp", 0.7);
+        } catch (error) {
+            reject(new Error("비디오 프레임에 접근할 수 없습니다 (CORS 보안)."));
+        }
+    });
+}
+
+async function sendToBackend(blob, mediaType, analysisMode = FACE_CROP_ANALYSIS_MODE) {
+    const formData = new FormData();
+    formData.append("file", blob, "capture.webp"); 
+    formData.append("sourceUrl", window.location.href);
+    formData.append("mediaType", mediaType);
+    formData.append("clientType", "chrome-extension");
+    formData.append("analysisMode", analysisMode);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+    try {
+        const response = await fetch(API_URL, {
+            method: "POST",
+            body: formData,
+            signal: controller.signal
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+            const error = new Error(`Server Error`);
+            error.status = response.status;
+            throw error;
+        }
+
+        const data = await response.json();
+        if (!data) throw new Error("분석이 정상적으로 완료되지 않았습니다.");
+
+        if (data.status === "DONE" && data.result) return data;
+
+        if ((data.status === "PROCESSING" || data.status === "QUEUED") && data.requestId) {
+            return await pollDetectionResult(data.requestId);
+        }
+
+        if (data.status === "FAILED") throw new Error(data?.message || "Analysis failed");
+
+        throw new Error(data?.message || "분석이 정상적으로 완료되지 않았습니다.");
+
+    } catch (err) {
+        clearTimeout(timeoutId);
+        if (err.name === 'AbortError') {
+            const timeoutErr = new Error("Timeout");
+            timeoutErr.status = 408;
+            throw timeoutErr;
+        }
+        throw err;
     }
 }
 
@@ -135,7 +248,6 @@ function updateStatusBadge(media, status, data = null) {
         font-weight: bold; font-family: sans-serif; box-shadow: 0 2px 4px rgba(0,0,0,0.5);
         transition: all 0.2s ease; user-select: none; cursor: default;
         pointer-events: auto !important;
-
         box-sizing: border-box !important;
         line-height: normal !important;
     `;
@@ -268,19 +380,11 @@ function updateStatusBadge(media, status, data = null) {
                 cursor: "default",
                 pointerEvents: "auto",
                 transition: "box-shadow 0.3s ease",
-
                 boxSizing: "border-box",
                 fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
                 margin: "0",
                 letterSpacing: "normal"
             });
-
-            const isFake = status === "fake";
-            const rawConf = result.confidence || 0;
-            const displayScore = isFake ? (rawConf * 100) : ((1 - rawConf) * 100);
-            const scoreLabel = isFake ? "조작 의심 확률" : "원본 일치율";
-            const scoreColor = isFake ? "#ef4444" : "#10b981";
-            const barGradient = isFake ? "linear-gradient(90deg, #f87171, #ef4444)" : "linear-gradient(90deg, #34d399, #10b981)";
 
             detailsBox.innerHTML = `
 <div class="veritai-drag-handle" style="color:lightskyblue; font-weight:bold; margin-bottom:12px; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:8px; font-size:14px; display:flex; justify-content:space-between; align-items: center; cursor: grab; user-select: none;">
@@ -290,25 +394,33 @@ function updateStatusBadge(media, status, data = null) {
 <div style="display: flex; flex-direction: column; gap: 6px;">
     <div><b>ID:</b> <span style="color:#e2e8f0;">${data.requestId || 'N/A'}</span></div>
     <div><b>판정:</b> ${readDeepfakeFlag(result) ? "<span style='color:#ef4444; font-weight:bold;'>조작 의심</span>" : "<span style='color:#10b981; font-weight:bold;'>정상</span>"}</div>
-    <div style="margin-top: 4px;">
-        <b>상세 분석률:</b>
-        <div style="display: flex; justify-content: space-between; font-size: 11px; margin: 4px 0;">
-            <span>${scoreLabel}</span>
-            <span style="font-weight: bold; color: ${scoreColor};">
-                ${displayScore.toFixed(1)}%
-            </span>
-        </div>
-        <div style="width: 100%; height: 6px; background: rgba(0,0,0,0.3); border-radius: 3px; overflow: hidden; border: 1px solid rgba(255,255,255,0.05);">
-            <div style="width: ${Math.max(displayScore, 2)}%; height: 100%; background: ${barGradient}; transition: width 0.2s ease-out;"></div>
-        </div>
-    </div>
-    <div style="margin-top: 4px;"><b>시간:</b> <span style="color:#e2e8f0;">${result.processingTimeMs || 0}ms</span></div>
-    <div><b>얼굴 수:</b> <span style="color:#e2e8f0;">${result.faceCount || faces.length}명</span></div>
 </div>
+
+<div style="margin:12px 0; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 8px; background: rgba(0,0,0,0.2);">
+    
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <div style="font-weight: bold; font-size: 11px; color: #94a3b8;" id="veritai-visual-title">감지 영역 (기본)</div>
+        <button id="veritai-toggle-xai-btn" style="font-size: 10px; padding: 2px 6px; background: #3b82f6; color: white; border: none; border-radius: 3px; cursor: pointer;" ${!result.heatmapBase64 ? 'disabled' : ''}>
+            ${result.heatmapBase64 ? 'AI 분석 근거 보기' : '히트맵 데이터 없음'}
+        </button>
+    </div>
+
+    <div style="position: relative; width: 100%; height: 160px; background: #0f172a; border-radius: 4px; overflow: hidden; border: 1px solid #333; display: flex; align-items: center; justify-content: center;">
+        <canvas id="veritai-bbox-canvas" style="position: absolute; max-width: 100%; max-height: 100%; object-fit: contain; z-index: 2;"></canvas>
+        <canvas id="veritai-heatmap-canvas" style="display: none; position: absolute; max-width: 100%; max-height: 100%; object-fit: contain; z-index: 1;"></canvas>
+    </div>
+
+    <div id="veritai-slider-container" style="display: none; margin-top: 8px; align-items: center; gap: 8px;">
+        <span style="font-size: 10px; color: #64748b;">원본</span>
+        <input type="range" id="veritai-heatmap-slider" min="0" max="100" value="70" style="flex: 1; accent-color: #ef4444; cursor: pointer;">
+        <span style="font-size: 10px; color: #ef4444;">히트맵</span>
+    </div>
+</div>
+
 <div style="margin:12px 0; border-top:1px dashed rgba(255,255,255,0.2);"></div>
 ${faceText}
 <div style="margin-top: 15px; display: flex; justify-content: flex-end;">
-    <button class="veritai-feedback-btn" style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); color: #f87171; border-radius: 20px; cursor: pointer; font-size: 11px; font-weight: bold; width: 80px !important; height: 28px; display: flex; align-items: center; justify-content: center; transition: all 0.2s;">🚨 오답 신고</button>
+    <button class="veritai-feedback-btn" style="font-size: 11px; padding: 4px 8px; cursor: pointer; background: rgba(255, 60, 60, 0.1); color: #ff6b6b; border: 1px solid rgba(255, 60, 60, 0.3); border-radius: 4px; transition: all 0.2s;">🚨 오답 신고</button>
 </div>
             `.trim();
 
@@ -327,6 +439,111 @@ ${faceText}
             };
 
             document.body.appendChild(detailsBox);
+
+            const bboxCanvas = detailsBox.querySelector('#veritai-bbox-canvas');
+            const heatmapCanvas = detailsBox.querySelector('#veritai-heatmap-canvas');
+            const slider = detailsBox.querySelector('#veritai-heatmap-slider');
+
+            if (bboxCanvas && heatmapCanvas) {
+                const bCtx = bboxCanvas.getContext('2d');
+                const hCtx = heatmapCanvas.getContext('2d');
+                const imgObj = new Image();
+                imgObj.crossOrigin = "anonymous";
+                
+                imgObj.onload = () => {
+                    bboxCanvas.width = imgObj.width;
+                    bboxCanvas.height = imgObj.height;
+                    heatmapCanvas.width = imgObj.width;
+                    heatmapCanvas.height = imgObj.height;
+
+                    bCtx.drawImage(imgObj, 0, 0);
+                    if (faces && faces.length > 0) {
+                        faces.forEach((f, i) => {
+                            if (f.bbox && f.bbox.w > 0) {
+                                bCtx.lineWidth = Math.max(3, imgObj.width / 150);
+                                const isFake = (f.fakeProbability || f.confidence || 0) >= 0.5;
+                                bCtx.strokeStyle = isFake ? "#ef4444" : "#10b981"; 
+                                bCtx.fillStyle = isFake ? "rgba(239, 68, 68, 0.2)" : "rgba(16, 185, 129, 0.2)";
+                                bCtx.strokeRect(f.bbox.x, f.bbox.y, f.bbox.w, f.bbox.h);
+                                bCtx.fillRect(f.bbox.x, f.bbox.y, f.bbox.w, f.bbox.h);
+                                bCtx.font = `${Math.max(16, imgObj.width / 25)}px sans-serif`;
+                                bCtx.fillStyle = bCtx.strokeStyle;
+                                bCtx.fillText(`얼굴 ${i + 1}`, f.bbox.x, f.bbox.y - 5);
+                            }
+                        });
+                    }
+
+                    // 히트맵
+                    if (result.heatmapBase64) {
+                        let bestFace = faces && faces.length > 0 ? faces[0] : null;
+                        let maxScore = -1;
+                        if (faces) {
+                            faces.forEach(f => {
+                                const score = f.fakeProbability || f.confidence || (f.detectionConfidence || 0);
+                                if (score > maxScore) { maxScore = score; bestFace = f; }
+                            });
+                        }
+
+                        const hmImg = new Image();
+                        hmImg.onload = () => {
+                            const drawHeatmap = (opacity) => {
+                                hCtx.clearRect(0, 0, heatmapCanvas.width, heatmapCanvas.height);
+                                hCtx.drawImage(imgObj, 0, 0); 
+                                
+                                hCtx.globalAlpha = opacity;
+                                hCtx.globalCompositeOperation = "screen"; 
+                                
+                                if (bestFace && bestFace.bbox) {
+                                    hCtx.drawImage(hmImg, bestFace.bbox.x, bestFace.bbox.y, bestFace.bbox.w, bestFace.bbox.h);
+                                } else {
+                                    hCtx.drawImage(hmImg, 0, 0, imgObj.width, imgObj.height);
+                                }
+                                
+                                hCtx.globalAlpha = 1.0;
+                                hCtx.globalCompositeOperation = "source-over";
+                            };
+
+                            drawHeatmap(slider.value / 100);
+
+                            if (slider) {
+                                slider.addEventListener('input', (e) => {
+                                    drawHeatmap(e.target.value / 100);
+                                });
+                            }
+                        };
+                        hmImg.src = "data:image/jpeg;base64," + result.heatmapBase64;
+                    }
+                };
+                imgObj.src = mediaSrc;
+            }
+
+            const toggleBtn = detailsBox.querySelector('#veritai-toggle-xai-btn');
+            const visualTitle = detailsBox.querySelector('#veritai-visual-title');
+            const sliderContainer = detailsBox.querySelector('#veritai-slider-container');
+            let isHeatmapMode = false;
+
+            if (toggleBtn && result.heatmapBase64) {
+                toggleBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    isHeatmapMode = !isHeatmapMode;
+                    
+                    if (isHeatmapMode) {
+                        bboxCanvas.style.display = 'none';
+                        heatmapCanvas.style.display = 'block';
+                        sliderContainer.style.display = 'flex';
+                        toggleBtn.innerText = '감지 박스로 돌아가기';
+                        toggleBtn.style.background = '#64748b';
+                        visualTitle.innerText = 'XAI 분석 근거 (히트맵)';
+                    } else {
+                        bboxCanvas.style.display = 'block';
+                        heatmapCanvas.style.display = 'none';
+                        sliderContainer.style.display = 'none';
+                        toggleBtn.innerText = 'AI 분석 근거 보기';
+                        toggleBtn.style.background = '#3b82f6';
+                        visualTitle.innerText = '감지 영역 (기본)';
+                    }
+                });
+            }
 
             const dragHandle = detailsBox.querySelector('.veritai-drag-handle');
             let isDragging = false;
@@ -526,6 +743,7 @@ ${faceText}
         }
     }
 }
+
 async function startInspection(media) {
     if (!isSystemOn || !shouldInspectMedia(media)) return;
 
@@ -608,11 +826,14 @@ async function startInspection(media) {
             friendlyMessage = "서버 내부 오류";
         } else if (err.name === 'TypeError' && err.message === 'Failed to fetch') {
             friendlyMessage = "서버 연결 실패 (서버 꺼짐)";
-        } else if (err.message.includes("CORS")) {
+        } else if (err.message.includes("CORS") || err.message.includes("보안 차단됨")) {
             friendlyMessage = "보안 정책 차단";
         } else if (err.status === 400 || err.status === 415) {
             friendlyMessage = "지원하지 않는 이미지";
+        } else {
+            friendlyMessage = err.message || "분석 실패";
         }
+        
         updateStatusBadge(media, "error", { message: friendlyMessage });
         delete media.dataset.veritaiScanned;
         if (media.dataset.veritaiScanKey) {
@@ -650,7 +871,6 @@ const domObserver = new MutationObserver((mutations) => {
     if (!isSystemOn) return;
 
     mutations.forEach(mutation => {
-        
         if (mutation.addedNodes) {
             mutation.addedNodes.forEach(node => {
                 if (node.nodeType === 1 && (node.tagName === 'IMG' || node.tagName === 'VIDEO')) {
@@ -734,7 +954,7 @@ function attachUI(media, retryCount = 0) {
     delete media.dataset.veritaiScanned;
 
     if (isAutoScanMode && media.tagName !== 'VIDEO') {
-        autoScanObserver.observe(media); // 이미지만 자동 스캔
+        autoScanObserver.observe(media); 
     } else {
         if (wrapper && !wrapper.querySelector('.veritai-check-btn')) {
             const btn = document.createElement("button");
@@ -820,111 +1040,6 @@ chrome.storage.local.get(['isSystemOn', 'isAutoScanOn'], (result) => {
         }
     }, 500);
 });
-
-async function captureVideoBlob(video) {
-    if (!video) throw new Error("영상 요소를 찾을 수 없습니다.");
-    const width = video.videoWidth || video.clientWidth;
-    const height = video.videoHeight || video.clientHeight;
-    if (width === 0 || height === 0) throw new Error("영상 크기를 인식할 수 없습니다.");
-
-    return new Promise((resolve, reject) => {
-        try {
-            const canvas = document.createElement("canvas");
-            canvas.width = width;
-            canvas.height = height;
-            const ctx = canvas.getContext("2d");
-            if (!ctx) return reject(new Error("캔버스 컨텍스트를 생성하지 못했습니다."));
-            if (!video.crossOrigin) { video.crossOrigin = "anonymous"; }
-            ctx.drawImage(video, 0, 0, width, height);
-            canvas.toBlob((blob) => {
-                if (!blob) return reject(new Error("영상 프레임 데이터를 생성하지 못했습니다."));
-                resolve(blob);
-            }, "image/jpeg", 0.75);
-        } catch (error) {
-            reject(new Error("비디오 프레임에 접근할 수 없습니다 (CORS 보안)."));
-        }
-    });
-}
-
-async function captureImageBlob(url) {
-    if (!url) throw new Error("이미지 주소가 없습니다.");
-    return new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage({ action: "fetch_image", url: url }, (response) => {
-            if (chrome.runtime.lastError || !response || response.error) {
-                return reject(new Error("이미지를 불러오지 못했습니다 (보안 차단됨)."));
-            }
-            const img = new Image();
-            img.onload = () => {
-                try {
-                    const canvas = document.createElement("canvas");
-                    const ctx = canvas.getContext("2d");
-                    if (!ctx) return reject(new Error("캔버스 컨텍스트를 생성하지 못했습니다."));
-                    canvas.width = img.naturalWidth || img.width;
-                    canvas.height = img.naturalHeight || img.height;
-                    if (canvas.width === 0 || canvas.height === 0)
-                        return reject(new Error("이미지 크기가 0입니다."));
-                    ctx.drawImage(img, 0, 0);
-                    canvas.toBlob((blob) => {
-                        if (!blob) return reject(new Error("이미지 데이터를 생성하지 못했습니다."));
-                        resolve(blob);
-                    }, "image/jpeg", 0.75);
-                } catch (error) { reject(error); }
-            };
-            img.onerror = () => reject(new Error("가져온 이미지를 렌더링하지 못했습니다."));
-            img.src = response.dataUrl;
-        });
-    });
-}
-
-async function sendToBackend(blob, mediaType, analysisMode = FACE_CROP_ANALYSIS_MODE) {
-    const formData = new FormData();
-    formData.append("file", blob, "capture.jpg");
-    formData.append("sourceUrl", window.location.href);
-    formData.append("mediaType", mediaType);
-    formData.append("clientType", "chrome-extension");
-    formData.append("analysisMode", analysisMode);
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000);
-
-    try {
-        const response = await fetch(API_URL, {
-            method: "POST",
-            body: formData,
-            signal: controller.signal
-        });
-
-        clearTimeout(timeoutId);
-
-        if (!response.ok) {
-            const error = new Error(`Server Error`);
-            error.status = response.status;
-            throw error;
-        }
-
-        const data = await response.json();
-        if (!data) throw new Error("분석이 정상적으로 완료되지 않았습니다.");
-
-        if (data.status === "DONE" && data.result) return data;
-
-        if ((data.status === "PROCESSING" || data.status === "QUEUED") && data.requestId) {
-            return await pollDetectionResult(data.requestId);
-        }
-
-        if (data.status === "FAILED") throw new Error(data?.message || "Analysis failed");
-
-        throw new Error(data?.message || "분석이 정상적으로 완료되지 않았습니다.");
-
-    } catch (err) {
-        clearTimeout(timeoutId);
-        if (err.name === 'AbortError') {
-            const timeoutErr = new Error("Timeout");
-            timeoutErr.status = 408;
-            throw timeoutErr;
-        }
-        throw err;
-    }
-}
 
 function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));

@@ -138,9 +138,44 @@ def env_int(name, default, minimum=None):
     return value
 
 
+def env_float(name, default, minimum=None, maximum=None):
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
 DEBUG_ARTIFACTS = env_bool("VERITAI_DEBUG_ARTIFACTS", False)
 MAX_IMAGE_WIDTH = env_int("VERITAI_MAX_IMAGE_WIDTH", 1280, minimum=320)
 MAX_FACE_CANDIDATES = env_int("VERITAI_MAX_FACE_CANDIDATES", 8, minimum=1)
+FACE_INITIAL_NMS_IOU = env_float("VERITAI_FACE_INITIAL_NMS_IOU", 0.24, minimum=0.05, maximum=0.95)
+FACE_REFINED_NMS_IOU = env_float("VERITAI_FACE_REFINED_NMS_IOU", 0.28, minimum=0.05, maximum=0.95)
+HAAR_TEXTURE_FP_FILTER = env_bool("VERITAI_HAAR_TEXTURE_FP_FILTER", True)
+CANDIDATE_BBOX_RETENTION = os.getenv("VERITAI_CANDIDATE_BBOX_RETENTION", "none").strip().lower()
+if CANDIDATE_BBOX_RETENTION in {"", "off", "false", "0"}:
+    CANDIDATE_BBOX_RETENTION = "none"
+if CANDIDATE_BBOX_RETENTION not in {"none", "precision_guarded"}:
+    CANDIDATE_BBOX_RETENTION = "none"
+RETENTION_FEATURE_GUARD = os.getenv("VERITAI_RETENTION_FEATURE_GUARD", "none").strip().lower()
+if RETENTION_FEATURE_GUARD in {"", "off", "false", "0"}:
+    RETENTION_FEATURE_GUARD = "none"
+if RETENTION_FEATURE_GUARD not in {"none", "anthropometric_material", "anthropometric_low_skin_saturation", "low_skin_profile", "eyes_closed_low_text_density", "retention_precision_combo", "retention_precision_combo_v2"}:
+    RETENTION_FEATURE_GUARD = "none"
+SERVICE_RETENTION_REJECT_REASONS = {
+    "blank-mannequin-zero-skin-material",
+    "frontal-face-without-eyes-and-low-structure",
+    "frontal-alt-low-chroma-sculpture-face",
+    "frontal-alt-low-support-low-skin",
+    "frontal-alt-low-skin-desaturated-edge-face",
+    "low-closure-low-saturation-nonhuman-face",
+    "low-face-like-score-with-weak-mouth-texture",
+    "symmetric-peak-pair-with-low-texture",
+}
 
 
 def normalize_path(path):
@@ -252,6 +287,150 @@ def non_max_suppression(candidates, iou_threshold=0.35):
         selected.append(current)
         remaining = [candidate for candidate in remaining if calculate_iou(current["box"], candidate["box"]) < iou_threshold]
     return selected
+
+
+def bbox_dict_to_tuple(bbox):
+    return int(bbox["x"]), int(bbox["y"]), int(bbox["w"]), int(bbox["h"])
+
+
+def should_retain_candidate_bbox_service(candidate, image_shape):
+    if CANDIDATE_BBOX_RETENTION != "precision_guarded":
+        return False
+    x, y, w, h = candidate["box"]
+    image_h, image_w = image_shape[:2]
+    image_area = float(max(image_w * image_h, 1))
+    width = float(max(w, 1))
+    height = float(max(h, 1))
+    area_ratio = (width * height) / image_area
+    aspect = width / height
+    min_side = min(width, height)
+    max_side = max(width, height)
+    detector = candidate.get("detector", "")
+    score = float(candidate.get("score", 0.0))
+
+    if not (0.48 <= aspect <= 1.60):
+        return False
+    if min_side < 32:
+        return False
+    if max_side > max(image_w, image_h) * 0.78:
+        return False
+    if not (0.025 <= area_ratio <= 0.145):
+        return False
+
+    if detector == "frontal_alt":
+        return score >= 0.9955 and area_ratio <= 0.135
+    if detector == "frontal":
+        return score >= 0.32 and area_ratio <= 0.120
+    if detector == "profile":
+        return score >= 0.13 and area_ratio <= 0.120
+    return False
+
+
+def candidate_retention_priority_service(candidate, image_shape):
+    x, y, w, h = candidate["box"]
+    image_h, image_w = image_shape[:2]
+    image_area = float(max(image_w * image_h, 1))
+    area_ratio = (float(max(w, 1)) * float(max(h, 1))) / image_area
+    detector = candidate.get("detector", "")
+    score = float(candidate.get("score", 0.0))
+    detector_weight = {
+        "frontal_alt": 0.40,
+        "frontal": 0.34,
+        "profile": 0.28,
+    }.get(detector, 0.0)
+    compactness = max(0.0, 1.0 - area_ratio / 0.12)
+    return detector_weight + 0.45 * score + 0.15 * compactness
+
+
+def should_block_retention_by_feature_guard(face, keep_reason):
+    if RETENTION_FEATURE_GUARD == "none":
+        return False
+    texture = face.get("deepfakeFeatures", {}).get("texture", {})
+    quality = face.get("quality", {})
+    skin_ratio = float(texture.get("skinRatio", 0.0))
+    edge_density = float(texture.get("edgeDensity", 0.0))
+    quality_score = float(quality.get("score", 0.0))
+
+    anthropometric_material_guard = (
+        keep_reason == "frontal-alt-anthropometric-outlier"
+        and skin_ratio < 0.08
+        and edge_density < 0.06
+        and quality_score >= 0.75
+    )
+    saturation_mean = float(texture.get("colorSaturationMean", 0.0))
+    anthropometric_low_skin_saturation_guard = (
+        keep_reason == "frontal-alt-anthropometric-outlier"
+        and skin_ratio < 0.05
+        and saturation_mean < 0.30
+    )
+    anthropometric_low_saturation_quality_guard = (
+        keep_reason == "frontal-alt-anthropometric-outlier"
+        and saturation_mean < 0.1264
+        and quality_score < 0.8252
+    )
+    low_skin_profile_guard = keep_reason == "profile-low-face-like-low-skin-without-eyes" and skin_ratio < 0.02
+    text_density = float(texture.get("printTextComponentDensity", 999.0))
+    eyes_closed_low_text_density_guard = (
+        keep_reason == "frontal-alt-eyes-closed-with-too-few-detected-points"
+        and text_density < 6.0
+    )
+
+    if RETENTION_FEATURE_GUARD == "anthropometric_material":
+        return anthropometric_material_guard
+    if RETENTION_FEATURE_GUARD == "anthropometric_low_skin_saturation":
+        return anthropometric_low_skin_saturation_guard
+    if RETENTION_FEATURE_GUARD == "low_skin_profile":
+        return low_skin_profile_guard
+    if RETENTION_FEATURE_GUARD == "eyes_closed_low_text_density":
+        return eyes_closed_low_text_density_guard
+    if RETENTION_FEATURE_GUARD == "retention_precision_combo":
+        return (
+            anthropometric_low_skin_saturation_guard
+            or low_skin_profile_guard
+            or eyes_closed_low_text_density_guard
+        )
+    if RETENTION_FEATURE_GUARD == "retention_precision_combo_v2":
+        return (
+            anthropometric_low_skin_saturation_guard
+            or anthropometric_low_saturation_quality_guard
+            or low_skin_profile_guard
+            or eyes_closed_low_text_density_guard
+        )
+    return False
+
+
+def should_retain_rejected_face_service(face, candidate, image_shape, keep_reason):
+    if keep_reason in SERVICE_RETENTION_REJECT_REASONS:
+        return False
+    if should_block_retention_by_feature_guard(face, keep_reason):
+        return False
+    quality_label = face.get("quality", {}).get("label")
+    face_like_score = float(face.get("faceLikeScore", 0.0))
+    score = float(candidate.get("score", 0.0))
+    detector = candidate.get("detector", "")
+    if keep_reason == "frontal-alt-single-eye-mirror-low-structure":
+        return (
+            detector == "frontal_alt"
+            and quality_label == "good"
+            and score >= 0.9964
+            and should_retain_candidate_bbox_service(candidate, image_shape)
+        )
+    if keep_reason == "haar-low-chroma-texture-face":
+        return (
+            detector == "frontal_alt"
+            and quality_label == "good"
+            and score >= 0.9963
+            and face_like_score >= 0.72
+            and should_retain_candidate_bbox_service(candidate, image_shape)
+        )
+    if keep_reason == "weak-profile-candidate-without-eyes":
+        return (
+            detector == "profile"
+            and quality_label == "good"
+            and face_like_score >= 0.41
+            and should_retain_candidate_bbox_service(candidate, image_shape)
+        )
+    return should_retain_candidate_bbox_service(candidate, image_shape)
 
 
 def normalize_weight(weight, fallback=0.58):
@@ -908,7 +1087,7 @@ def detect_faces(preprocessed):
             candidate["detector"] = detector_name
             candidate["score"] = normalize_weight(candidate["rawWeight"], fallback=0.62 if detector_name.startswith("frontal") else 0.55)
             candidates.append(candidate)
-    candidates = non_max_suppression(candidates, iou_threshold=0.24)
+    candidates = non_max_suppression(candidates, iou_threshold=FACE_INITIAL_NMS_IOU)
     candidates = suppress_contained_candidates(candidates)
     if not candidates or max(candidate["score"] for candidate in candidates) < 0.58 or len(candidates) < 2:
         candidates.extend(generate_response_face_proposals(preprocessed))
@@ -922,7 +1101,7 @@ def detect_faces(preprocessed):
     for candidate in candidates:
         refined_box = candidate["box"] if candidate.get("preexpanded") else expand_detected_box(candidate["box"], image.shape, candidate["detector"])
         refined.append({**candidate, "box": refined_box})
-    refined = non_max_suppression(refined, iou_threshold=0.28)
+    refined = non_max_suppression(refined, iou_threshold=FACE_REFINED_NMS_IOU)
     refined = suppress_contained_candidates(refined)
     protected_low_priority = []
     for candidate in low_priority_profile_candidates:
@@ -1861,6 +2040,86 @@ def compute_color_texture_features(face_bgr, face_mask=None):
     }
 
 
+def compute_print_like_texture_features(face_bgr):
+    if face_bgr.size == 0:
+        return {
+            "printEdgeDensity": 0.0,
+            "printStraightLineDensity": 0.0,
+            "printTextComponentDensity": 0.0,
+            "printHighContrastRatio": 0.0,
+            "printWhiteRatio": 0.0,
+            "printDarkRatio": 0.0,
+            "printSaturationStd": 0.0,
+        }
+
+    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2HSV)
+    height, width = gray.shape[:2]
+    area = float(max(1, height * width))
+
+    edges = cv2.Canny(gray, 70, 150)
+    edge_density = float(np.count_nonzero(edges)) / area
+
+    min_line_length = max(12, int(round(min(height, width) * 0.22)))
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180.0,
+        threshold=max(10, int(round(min(height, width) * 0.10))),
+        minLineLength=min_line_length,
+        maxLineGap=max(3, int(round(min(height, width) * 0.04))),
+    )
+    line_length = 0.0
+    if lines is not None:
+        for line in lines[:, 0, :]:
+            x1, y1, x2, y2 = [float(value) for value in line]
+            line_length += float(((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5)
+    straight_line_density = line_length / float(max(1.0, min(height, width) * max(height, width)))
+
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    adaptive = cv2.adaptiveThreshold(
+        blur,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        21,
+        8,
+    )
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(adaptive, 8)
+    text_like = 0
+    for label in range(1, num_labels):
+        _, _, component_width, component_height, component_area = stats[label]
+        if component_area < 4:
+            continue
+        component_ratio = component_area / area
+        if component_ratio > 0.08:
+            continue
+        aspect = component_width / float(max(component_height, 1))
+        if (
+            0.12 <= aspect <= 8.0
+            and 4 <= component_width <= max(6, int(width * 0.55))
+            and 4 <= component_height <= max(6, int(height * 0.45))
+        ):
+            text_like += 1
+    text_component_density = text_like / float(max(1.0, area / 10000.0))
+
+    local_mean = cv2.blur(gray.astype(np.float32), (9, 9))
+    high_contrast = np.abs(gray.astype(np.float32) - local_mean) >= 42.0
+    white_ratio = float(np.count_nonzero(gray >= 220)) / area
+    dark_ratio = float(np.count_nonzero(gray <= 45)) / area
+    saturation_std = float(np.std(hsv[:, :, 1])) / 255.0
+
+    return {
+        "printEdgeDensity": round(edge_density, 4),
+        "printStraightLineDensity": round(straight_line_density, 4),
+        "printTextComponentDensity": round(text_component_density, 4),
+        "printHighContrastRatio": round(float(np.count_nonzero(high_contrast)) / area, 4),
+        "printWhiteRatio": round(white_ratio, 4),
+        "printDarkRatio": round(dark_ratio, 4),
+        "printSaturationStd": round(saturation_std, 4),
+    }
+
+
 def compute_occlusion_appearance_features(face_bgr, face_gray, face_mask=None):
     if face_gray.size == 0:
         return {"upperDarkRatio": 0.0, "midDarkRatio": 0.0, "lowerDarkRatio": 0.0, "appearanceOcclusionScore": 0.0}
@@ -1922,6 +2181,7 @@ def compute_deepfake_features(face_bgr, face_gray, bbox, keypoints, pose_label, 
     noise_score = round(compute_noise_score(face_gray, face_mask), 4)
     skin_ratio = round(compute_skin_ratio(face_bgr, face_mask), 4)
     color_texture = compute_color_texture_features(face_bgr, face_mask)
+    print_texture = compute_print_like_texture_features(face_bgr)
     appearance_occlusion = compute_occlusion_appearance_features(face_bgr, face_gray, face_mask)
     eye_visibility = round(len(eye_selection) / 2.0, 4)
     eye_closure_index = round(float(eye_metrics.get("closureScore", 0.0)), 4)
@@ -2068,6 +2328,13 @@ def compute_deepfake_features(face_bgr, face_gray, bbox, keypoints, pose_label, 
             "lowSaturationRatio": color_texture["lowSaturationRatio"],
             "highSaturationRatio": color_texture["highSaturationRatio"],
             "colorChromaStd": color_texture["chromaStd"],
+            "printEdgeDensity": print_texture["printEdgeDensity"],
+            "printStraightLineDensity": print_texture["printStraightLineDensity"],
+            "printTextComponentDensity": print_texture["printTextComponentDensity"],
+            "printHighContrastRatio": print_texture["printHighContrastRatio"],
+            "printWhiteRatio": print_texture["printWhiteRatio"],
+            "printDarkRatio": print_texture["printDarkRatio"],
+            "printSaturationStd": print_texture["printSaturationStd"],
         },
         "visibility": {
             "estimatedPointRatio": estimated_ratio,
@@ -2794,6 +3061,33 @@ def should_keep_face(face):
     nose_y_ratio = (float(face["keypoints"].get("nose_tip", {}).get("y", bbox_y)) - bbox_y) / height_f
     mouth_y_ratio = (mouth_y - bbox_y) / height_f
     nose_to_mouth_ratio = (mouth_y - float(face["keypoints"].get("nose_tip", {}).get("y", bbox_y))) / height_f
+
+    haar_low_chroma_real_face_rescue = (
+        face.get("detector") in {"frontal", "frontal_alt"}
+        and quality.get("label") == "good"
+        and eye_visibility >= 1.0
+        and float(face.get("featureSummary", {}).get("eyeEvidence", 0.0)) >= 0.55
+        and float(face.get("featureSummary", {}).get("noseEvidence", 0.0)) >= 0.90
+        and face_like_score >= 0.72
+        and edge_density >= 0.13
+        and color_chroma_std >= 3.70
+    )
+
+    if (
+        HAAR_TEXTURE_FP_FILTER
+        and face.get("detector") in {"frontal", "frontal_alt"}
+        and not bool(face.get("detectorConsensus"))
+        and skin_ratio >= 0.95
+        and 2.0 <= color_chroma_std <= 4.5
+        and mouth_evidence <= 0.30
+        and face_like_score <= 0.75
+        and 0.18 <= eye_distance_ratio <= 0.42
+        and not grayscale_real_face_rescue
+        and not strong_rescue_face
+        and not landmark_consensus_face_rescue
+        and not haar_low_chroma_real_face_rescue
+    ):
+        return False, "haar-low-chroma-texture-face"
 
     if face.get("detector") == "dark_profile_silhouette":
         if not (
@@ -4390,6 +4684,7 @@ def is_likely_mannequin_head_cluster(faces):
 
 def build_face_output(image, preprocessed, candidates, request_uid, analysis_mode="full_image"):
     faces = []
+    retention_pool = []
     debug_maps = {"eye": [], "nose": [], "mouth": []}
     crop_only_mode = analysis_mode == "face_crop_only"
     for index, candidate in enumerate(candidates):
@@ -4540,6 +4835,17 @@ def build_face_output(image, preprocessed, candidates, request_uid, analysis_mod
         keep_face, keep_reason = should_keep_face(face)
         face["candidateDecision"] = {"accepted": keep_face, "reason": keep_reason}
         if not keep_face:
+            if CANDIDATE_BBOX_RETENTION == "precision_guarded" and should_retain_rejected_face_service(face, candidate, image.shape, keep_reason):
+                retention_pool.append(
+                    {
+                        "face": face,
+                        "candidate": candidate,
+                        "originalKeepReason": keep_reason,
+                        "eyeResponse": eye_response,
+                        "noseResponse": nose_response,
+                        "mouthResponse": mouth_response,
+                    }
+                )
             continue
         refine_face_label_after_quality(face)
         face["trainingSample"] = build_training_sample(face)
@@ -4547,6 +4853,31 @@ def build_face_output(image, preprocessed, candidates, request_uid, analysis_mod
         debug_maps["eye"].append({"bbox": face["bbox"], "response": eye_response})
         debug_maps["nose"].append({"bbox": face["bbox"], "response": nose_response})
         debug_maps["mouth"].append({"bbox": face["bbox"], "response": mouth_response})
+    if CANDIDATE_BBOX_RETENTION == "precision_guarded" and retention_pool:
+        retention_pool = sorted(
+            retention_pool,
+            key=lambda item: candidate_retention_priority_service(item["candidate"], image.shape),
+            reverse=True,
+        )
+        for retained in retention_pool:
+            face = retained["face"]
+            if any(calculate_iou(bbox_dict_to_tuple(face["bbox"]), bbox_dict_to_tuple(existing["bbox"])) >= 0.35 for existing in faces):
+                continue
+            face["candidateRetention"] = {
+                "strategy": CANDIDATE_BBOX_RETENTION,
+                "originalRejectReason": retained["originalKeepReason"],
+            }
+            face["candidateDecision"] = {
+                "accepted": True,
+                "reason": "candidate-bbox-retention-precision-guarded",
+            }
+            refine_face_label_after_quality(face)
+            face["trainingSample"] = build_training_sample(face)
+            faces.append(face)
+            debug_maps["eye"].append({"bbox": face["bbox"], "response": retained["eyeResponse"]})
+            debug_maps["nose"].append({"bbox": face["bbox"], "response": retained["noseResponse"]})
+            debug_maps["mouth"].append({"bbox": face["bbox"], "response": retained["mouthResponse"]})
+            break
     if is_likely_mannequin_head_cluster(faces):
         return [], {"eye": [], "nose": [], "mouth": []}
     return faces, debug_maps

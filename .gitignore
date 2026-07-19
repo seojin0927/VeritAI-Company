@@ -36,6 +36,16 @@ images/faces/
 images/tuning_runs/
 uploads/
 
+### Evaluation datasets ###
+datasets/eval_faces/raw/
+datasets/eval_faces/processed/
+!datasets/eval_faces/raw/.gitkeep
+!datasets/eval_faces/raw/**/.gitkeep
+!datasets/eval_faces/processed/.gitkeep
+!datasets/eval_faces/processed/**/.gitkeep
+!datasets/eval_faces/manifests/
+!datasets/eval_faces/manifests/**
+
 ### Frontend / Extension ###
 frontend/node_modules/
 frontend/dist/

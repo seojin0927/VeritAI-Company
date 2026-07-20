@@ -9,6 +9,7 @@ Thumbs.db
 
 ### Git / Build caches ###
 .gradle/
+.jdks/
 **/.gradle/
 **/.gradle-home/
 **/build/
@@ -20,6 +21,7 @@ Thumbs.db
 **/.pytest_cache/
 
 ### Backend ###
+backend/backend_spring/gradle.properties
 backend/backend_spring/.classpath
 backend/backend_spring/.project
 backend/backend_spring/.settings/

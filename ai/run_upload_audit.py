@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import argparse
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -176,7 +178,7 @@ def export_review_artifacts(run_path: Path, result: dict) -> str | None:
     return review_dir.relative_to(ROOT).as_posix()
 
 
-def write_summary(run_path: Path, results: list[dict]) -> None:
+def write_summary(run_path: Path, results: list[dict], *, total_uploads: int, offset: int, limit: int | None) -> None:
     by_rating = Counter(result["evaluation"]["rating"] for result in results)
     by_group_rating = defaultdict(Counter)
     by_detected_type_rating = defaultdict(Counter)
@@ -189,6 +191,10 @@ def write_summary(run_path: Path, results: list[dict]) -> None:
         "generatedAt": datetime.now().isoformat(timespec="seconds"),
         "uploadDir": UPLOAD_DIR.relative_to(ROOT).as_posix(),
         "caseCount": len(results),
+        "totalUploadCount": total_uploads,
+        "offset": offset,
+        "limit": limit,
+        "retentionFeatureGuard": os.getenv("VERITAI_RETENTION_FEATURE_GUARD", "none"),
         "criteriaVersion": "upload-audit-v1",
         "ratingCounts": dict(sorted(by_rating.items())),
         "groupRatingCounts": {
@@ -213,6 +219,10 @@ def write_summary(run_path: Path, results: list[dict]) -> None:
         f"- Generated At: `{summary_payload['generatedAt']}`",
         f"- Upload Directory: `{summary_payload['uploadDir']}`",
         f"- Image Count: `{len(results)}`",
+        f"- Total Upload Count: `{total_uploads}`",
+        f"- Offset: `{offset}`",
+        f"- Limit: `{limit if limit is not None else 'all'}`",
+        f"- Retention Feature Guard: `{summary_payload['retentionFeatureGuard']}`",
         f"- Criteria Version: `{summary_payload['criteriaVersion']}`",
         f"- Review Directory: `{summary_payload['reviewRoot']}`",
         "",
@@ -276,11 +286,29 @@ def write_summary(run_path: Path, results: list[dict]) -> None:
     (run_path / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Audit face detection behavior on backend uploaded images.")
+    parser.add_argument("--offset", type=int, default=0, help="Number of sorted upload images to skip.")
+    parser.add_argument("--limit", type=int, default=None, help="Maximum number of upload images to audit.")
+    parser.add_argument("--label", default=None, help="Optional suffix for the output run directory.")
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     uploads = collect_uploads()
+    total_uploads = len(uploads)
+    offset = max(args.offset, 0)
+    if args.limit is not None and args.limit >= 0:
+        uploads = uploads[offset : offset + args.limit]
+    else:
+        uploads = uploads[offset:]
     label_index = build_label_index()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_path = RUN_DIR / timestamp
+    run_name = timestamp
+    if args.label:
+        run_name = f"{run_name}_{sanitize_part(args.label)}"
+    run_path = RUN_DIR / run_name
     run_path.mkdir(parents=True, exist_ok=True)
 
     results = []
@@ -296,8 +324,20 @@ def main() -> None:
         result["reviewDir"] = export_review_artifacts(run_path, result)
         results.append(result)
 
-    write_summary(run_path, results)
-    print(json.dumps({"runDir": run_path.as_posix(), "imageCount": len(results)}, ensure_ascii=False))
+    write_summary(run_path, results, total_uploads=total_uploads, offset=offset, limit=args.limit)
+    print(
+        json.dumps(
+            {
+                "runDir": run_path.as_posix(),
+                "imageCount": len(results),
+                "totalUploadCount": total_uploads,
+                "offset": offset,
+                "limit": args.limit,
+                "retentionFeatureGuard": os.getenv("VERITAI_RETENTION_FEATURE_GUARD", "none"),
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":
